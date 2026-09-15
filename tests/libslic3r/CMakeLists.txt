@@ -55,6 +55,14 @@ if (TARGET OpenVDB::openvdb)
 endif()
 
 target_link_libraries(${_TEST_NAME}_tests test_common libslic3r Catch2::Catch2WithMain)
+
+# `FlushVolCalculator` использует `RGB2HSV` из GUI-библиотеки.
+# Проверка порогов подключает реальную зависимость и доступна в сборках с GUI.
+if (TARGET libslic3r_gui)
+    target_sources(${_TEST_NAME}_tests PRIVATE test_flush_vol_calc.cpp)
+    target_link_libraries(${_TEST_NAME}_tests libslic3r_gui)
+endif()
+
 target_include_directories(${_TEST_NAME}_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 set_property(TARGET ${_TEST_NAME}_tests PROPERTY FOLDER "tests")
 

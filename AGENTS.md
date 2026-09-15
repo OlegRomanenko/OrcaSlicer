@@ -30,7 +30,18 @@ ctest --test-dir ./tests/fff_print
 - Docs live in `docs/`; the high-level design of a subsystem goes in `docs/HLSD/<subsystem>.md`.
 - Describe the design as it stands — what the subsystem does, why it exists, and the constraints that shape it. Not the route that got there: no phases, task lists, status markers, or "before/after this PR" framing.
 - Planning and investigation output (brainstorms, superpowers design and plan docs) stays in `docs/superpowers/`, which is gitignored. Never commit it.
-- Write a doc only when the design is not evident from the code, and when a change invalidates an existing one, update it in the same PR.
+- Документацию, кроме обязательных форк-карточек ниже, создавай только тогда, когда решение не очевидно из кода.
+  Если изменение делает существующий документ неактуальным, обновляй его в том же PR.
+
+### Форк-карточки
+
+- Перед реализацией каждой самостоятельной доработки форка обязательно создай отдельную handoff-карточку
+  в `docs/fork/`. Она относится к постоянной документации форка, а не к временным планам в `docs/superpowers/`.
+- В карточке опиши назначение, требуемое поведение и границы доработки, базу апстрима, затрагиваемые компоненты
+  и зависимости, способ реализации или переноса, а также проверки и ожидаемые результаты. Описание должно позволять
+  независимо реализовать доработку и верифицировать её после обновления из апстрима без контекста прежнего обсуждения.
+- Поддерживай карточку как актуальное описание: при изменении решения исправляй соответствующие разделы на месте.
+  Не включай историю операций и доработок, хронологию изменений, журналы выполнения, логи и результаты отдельных прогонов.
 
 ## Code Style
 

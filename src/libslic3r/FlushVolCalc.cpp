@@ -4,11 +4,13 @@
 #include "Utils.hpp"
 #include "FlushVolCalc.hpp"
 
+// Исходные объёмы продувки в мм³: цветовой расчёт и пороги для материала поддержки.
+// Коэффициент `flush_multiplier` применяется к заполненной матрице отдельно.
 
 namespace Slic3r {
 
-const int g_min_flush_volume_from_support = 700;
-const int g_flush_volume_to_support = 230;
+const int g_min_flush_volume_from_support = 800;
+const int g_flush_volume_to_support = 800;
 
 const int g_max_flush_volume = 20000; //Orca: increase limit to 20k vs 900 in upstream BBS code.
                                       // Retain a clamp to guard against extreme values entered in the UI
