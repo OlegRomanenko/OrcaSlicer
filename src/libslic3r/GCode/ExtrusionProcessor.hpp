@@ -3,6 +3,10 @@
 
 // This algorithm is copied from PrusaSlicer, original author is Pavel Mikus(pavel.mikus.mail@seznam.cz)
 
+// Оценка качества экструзии, скоростей и охлаждения по геометрии соседних слоёв.
+// Контакт поддержки дополняет опору только текущего слоя, не переносится как модель на следующие слои.
+// Локальный предел скорости разделяет отрезки по границе контакта, сохраняя их расход и оценку охлаждения.
+
 #include "../AABBTreeLines.hpp"
 //#include "../SupportSpotsGenerator.hpp"
 #include "../libslic3r.h"
@@ -395,8 +399,12 @@ struct ProcessedPoint
     Point3 p;
     float speed = 1.0f;
     float overlap = 1.0f;
+    // Длина исходного отрезка в мм до разделения по опоре; сохраняет компенсацию расхода малых областей.
+    double flow_length = 0.;
 };
 
+// Хранит геометрию соседних слоёв и кэш контакта для последовательного экспорта одного `Print`.
+// Слои принадлежат `Print` и не меняются во время экспорта; скорости и охлаждение обрабатываются независимо.
 class ExtrusionQualityEstimator
 {
     std::unordered_map<const PrintObject*, AABBTreeLines::LinesDistancer<Linef3>>      prev_layer_boundaries;
@@ -404,15 +412,90 @@ class ExtrusionQualityEstimator
     std::unordered_map<const PrintObject *, AABBTreeLines::LinesDistancer<CurledLine>> prev_curled_extrusions;
     std::unordered_map<const PrintObject *, AABBTreeLines::LinesDistancer<CurledLine>> next_curled_extrusions;
     const PrintObject                                                            *current_object;
+    const Layer *support_speed_layer = nullptr;
+    AABBTreeLines::LinesDistancer<Linef> support_speed_boundaries;
 
 public:
     void set_current_object(const PrintObject *object) { current_object = object; }
 
+    // Ограничивает скорость только внутри фактического контакта неизменяемого слоя.
+    // `points` описывает уже выбранные скорости исходящих отрезков; пустой вектор означает постоянную `speed`.
+    // При отсутствии замедления не меняет вектор и возвращает false. Новые точки сохраняют Z и режим охлаждения.
+    bool limit_speed_over_support(const Layer &layer, const ExtrusionPath &path, float speed, float limit,
+                                  std::vector<ProcessedPoint> &points)
+    {
+        if (layer.support_contact.empty() || path.polyline.points.size() < 2 || limit <= 0.f || speed <= limit)
+            return false;
+        if (support_speed_layer != &layer) {
+            support_speed_boundaries = AABBTreeLines::LinesDistancer<Linef>{to_unscaled_linesf(layer.support_contact)};
+            support_speed_layer = &layer;
+        }
+
+        std::vector<ProcessedPoint> constant_points;
+        if (points.empty()) {
+            constant_points.reserve(path.polyline.points.size());
+            for (const Point3 &point : path.polyline.points)
+                constant_points.push_back({point, speed, 1.f});
+        }
+        const auto &input = points.empty() ? constant_points : points;
+        std::vector<ProcessedPoint> result;
+        result.reserve(input.size());
+        bool limited = false;
+        for (size_t i = 0; i + 1 < input.size(); ++i) {
+            const ProcessedPoint &a = input[i];
+            const ProcessedPoint &b = input[i + 1];
+            const Vec3d start = unscaled(a.p);
+            const Vec3d delta = unscaled(b.p) - start;
+            const double xy_length_sq = delta.head<2>().squaredNorm();
+            if (a.speed <= limit || xy_length_sq < EPSILON * EPSILON) {
+                result.push_back(a);
+                continue;
+            }
+
+            // Проверяем все пересечения, даже если оба конца снаружи: между ними может находиться остров.
+            std::vector<double> cuts{0.};
+            for (const auto &intersection : support_speed_boundaries.intersections_with_line<true>(
+                     Linef{start.head<2>(), (start + delta).head<2>()})) {
+                const double t = std::clamp((intersection.first - start.head<2>()).dot(delta.head<2>()) / xy_length_sq, 0., 1.);
+                if (t > cuts.back() + 1e-9 && t < 1. - 1e-9)
+                    cuts.push_back(t);
+            }
+            cuts.push_back(1.);
+            for (size_t cut = 0; cut + 1 < cuts.size(); ++cut) {
+                ProcessedPoint point = a;
+                point.p = Point3::new_scale(Vec3d(start + cuts[cut] * delta));
+                const Vec2d midpoint = (start + 0.5 * (cuts[cut] + cuts[cut + 1]) * delta).head<2>();
+                if (support_speed_boundaries.outside(midpoint) <= 0) {
+                    point.speed = limit;
+                    limited = true;
+                }
+                // G-code включает охлаждение от нависания, только когда оба конца отрезка требуют его.
+                // Максимум перекрытия в добавленных точках сохраняет это решение для каждого фрагмента.
+                if (cut != 0)
+                    point.overlap = std::max(a.overlap, b.overlap);
+                point.flow_length = a.flow_length > 0. ? a.flow_length : delta.norm();
+                result.push_back(point);
+            }
+        }
+        if (!limited)
+            return false;
+        result.push_back(input.back());
+        points = std::move(result);
+        return true;
+    }
+
+    // Обновляет локальную опору для текущего объекта, включая поддержку без зазора.
+    // Сохраняет отдельную геометрию следующего слоя, чтобы не продлевать поддержку вверх по модели.
     void prepare_for_new_layer(const PrintObject * obj, const Layer *layer)
     {
         if (layer == nullptr) return;
         const PrintObject *object = obj;
         prev_layer_boundaries[object] = next_layer_boundaries[object];
+        if (!layer->support_contact.empty()) {
+            ExPolygons supported = layer->lower_layer == nullptr ? layer->support_contact :
+                union_ex(layer->lower_layer->lslices, layer->support_contact);
+            prev_layer_boundaries[object] = AABBTreeLines::LinesDistancer<Linef3>{to_unscaled_linesf3(supported)};
+        }
         next_layer_boundaries[object]  = AABBTreeLines::LinesDistancer<Linef3>{to_unscaled_linesf3(layer->lslices)};
         prev_curled_extrusions[object] = next_curled_extrusions[object];
         next_curled_extrusions[object] = AABBTreeLines::LinesDistancer<CurledLine>{layer->curled_lines};

@@ -1,6 +1,9 @@
 #ifndef slic3r_Layer_hpp_
 #define slic3r_Layer_hpp_
 
+// Слои модели и поддержки владеют геометрией и экструзиями нарезки.
+// Контакт поддержки хранится отдельно от сечений модели и используется только при нулевом Z-зазоре.
+
 #include "libslic3r.h"
 #include "BoundingBox.hpp"
 #include "Flow.hpp"
@@ -156,6 +159,9 @@ public:
     // These lslices are also used to detect overhangs and overlaps between successive layers, therefore it is important
     // that the 1st lslice is not compensated by the Elephant foot compensation algorithm.
     ExPolygons 				 lslices;
+    // Покрытие реальных экструзий поддержки на `bottom_z()`, подготовленное перед периметрами.
+    // Пустое значение не означает, что вся нижняя поверхность поддержана.
+    ExPolygons               support_contact;
     ExPolygons 				 lslices_extrudable;  // BBS: the extrudable part of lslices used for tree support
     std::vector<BoundingBox> lslices_bboxes;
     // Orca: for separated infills / per-model centering. Aligned with lslices: for each island, the

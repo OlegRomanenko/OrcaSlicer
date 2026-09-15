@@ -1,3 +1,5 @@
+// Геометрия периметров и внешних поверхностей региона, включая закрепление мостов.
+// Контакт поддержки дополняет локальную опору, не изменяя сечения самой модели.
 #include "Layer.hpp"
 #include "BridgeDetector.hpp"
 #include "ClipperUtils.hpp"
@@ -79,6 +81,8 @@ void LayerRegion::slices_to_fill_surfaces_clipped()
     }
 }
 
+// Передаёт обоим генераторам стенок объединённую опору от модели и готовой поддержки.
+// Временные полигоны живут до завершения синхронного вызова генератора и не меняют нижний слой.
 void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRegionPtrs &compatible_regions, SurfaceCollection* fill_surfaces, ExPolygons* fill_no_overlap)
 {
     this->perimeters.clear();
@@ -120,9 +124,15 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         fill_no_overlap
     );
     
+    ExPolygons supported_lower_slices;
     if (this->layer()->lower_layer != nullptr)
         // Cummulative sum of polygons over all the regions.
         g.lower_slices = &this->layer()->lower_layer->lslices;
+    if (!this->layer()->support_contact.empty()) {
+        supported_lower_slices = g.lower_slices == nullptr ? this->layer()->support_contact :
+            union_ex(*g.lower_slices, this->layer()->support_contact);
+        g.lower_slices = &supported_lower_slices;
+    }
     if (this->layer()->upper_layer != NULL)
         g.upper_slices = &this->layer()->upper_layer->lslices;
 
@@ -483,6 +493,8 @@ Surfaces expand_merge_surfaces(
     return out;
 }
 
+// Разделяет и расширяет внешние поверхности штатными волнами закрепления.
+// Обычные нижние поверхности над поддержкой доступны мостам как опорные зоны; занятые закреплением части вычитаются.
 void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Polygons *lower_layer_covered)
 {
     using namespace Slic3r::Algorithm;
@@ -522,14 +534,22 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
     ExPolygons shells = union_ex(fill_surfaces_extract_expolygons(this->fill_surfaces.surfaces, { stInternalSolid }, layer_thickness));
     ExPolygons sparse = union_ex(fill_surfaces_extract_expolygons(this->fill_surfaces.surfaces, {stInternal}, layer_thickness));
     ExPolygons top_expolygons = union_ex(fill_surfaces_extract_expolygons(this->fill_surfaces.surfaces, {stTop}, layer_thickness));
+    const bool has_support_contact = !this->layer()->support_contact.empty();
+    double supported_bottom_thickness = -1.;
+    ExPolygons supported_bottoms;
+    if (has_support_contact)
+        supported_bottoms = union_ex(fill_surfaces_extract_expolygons(
+            this->fill_surfaces.surfaces, {stBottom}, supported_bottom_thickness));
     const auto expansion_params_into_sparse_infill = RegionExpansionParameters::build(expansion_min, expansion_step, max_nr_expansion_steps);
     const auto expansion_params_into_solid_infill  = RegionExpansionParameters::build(expansion_bottom_bridge, expansion_step, max_nr_expansion_steps);
 
     std::vector<ExpansionZone> expansion_zones{
         ExpansionZone{std::move(shells), expansion_params_into_solid_infill},
         ExpansionZone{std::move(sparse), expansion_params_into_sparse_infill},
-        ExpansionZone{std::move(top_expolygons), expansion_params_into_solid_infill},
     };
+    if (has_support_contact)
+        expansion_zones.push_back(ExpansionZone{std::move(supported_bottoms), expansion_params_into_solid_infill});
+    expansion_zones.push_back(ExpansionZone{std::move(top_expolygons), expansion_params_into_solid_infill});
 
     SurfaceCollection bridges;
     {
@@ -572,6 +592,14 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
     }
 
     expansion_zones.pop_back();
+
+    // Возвращаем только часть острова, не занятую закреплением соседних мостовых пролётов.
+    if (has_support_contact) {
+        Surface bottom_templ(stBottom, {});
+        bottom_templ.thickness = supported_bottom_thickness;
+        this->fill_surfaces.append(std::move(expansion_zones.back().expolygons), bottom_templ);
+        expansion_zones.pop_back();
+    }
 
     expansion_zones.at(0).parameters = RegionExpansionParameters::build(expansion_bottom, expansion_step, max_nr_expansion_steps);
     Surfaces bottoms = expand_merge_surfaces(this->fill_surfaces.surfaces, stBottom, expansion_zones, closing_radius);

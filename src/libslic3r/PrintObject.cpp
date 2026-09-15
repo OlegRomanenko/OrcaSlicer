@@ -1,3 +1,5 @@
+// Геометрические этапы нарезки объекта и инвалидация их зависимых результатов.
+// Контакт поддержки вычисляется по готовым экструзиям, отдельно от исходных сечений модели.
 #include "Exception.hpp"
 #include "Model.hpp"
 #include "Point.hpp"
@@ -454,6 +456,30 @@ std::vector<std::set<int>> PrintObject::detect_extruder_geometric_unprintables()
 // 1) Merges typed region slices into stInternal type.
 // 2) Increases an "extra perimeters" counter at region slices where needed.
 // 3) Generates perimeters, gap fills and fill regions (fill regions of type stInternal).
+// Заполняет контактные области до параллельных проходов. Недействительная поддержка не читается:
+// первый проход сохраняет штатную генерацию поддержки, а окончательный использует её реальные линии.
+// Слои упорядочены по Z; поиск ограничивает построение покрытия совпадающей контактной высотой.
+void PrintObject::update_support_contacts()
+{
+    const bool use_support = has_support() && m_config.support_top_z_distance.value == 0. &&
+                             is_step_done(posSupportMaterial);
+    for (Layer *layer : m_layers) {
+        layer->support_contact.clear();
+        if (!use_support || layer->empty())
+            continue;
+        m_print->throw_if_canceled();
+        const double bottom_z = layer->bottom_z();
+        auto support = std::lower_bound(m_support_layers.begin(), m_support_layers.end(), bottom_z - EPSILON,
+            [](const SupportLayer *candidate, double z) { return candidate->print_z < z; });
+        Polygons contact;
+        for (; support != m_support_layers.end() && (*support)->print_z <= bottom_z + EPSILON; ++support)
+            (*support)->support_fills.polygons_covered_by_width(contact, float(SCALED_EPSILON));
+        if (!contact.empty())
+            layer->support_contact = intersection_ex(union_ex(contact), layer->lslices);
+    }
+}
+
+// Строит периметры из исходных сечений с актуальной локальной опорой; готовые сечения модели не расширяет поддержкой.
 void PrintObject::make_perimeters()
 {
     // prerequisites
@@ -461,6 +487,8 @@ void PrintObject::make_perimeters()
 
     if (! this->set_started(posPerimeters))
         return;
+
+    this->update_support_contacts();
 
     m_print->set_status(15, L("Generating walls"));
     BOOST_LOG_TRIVIAL(info) << "Generating walls..." << log_memory_info();
@@ -1596,6 +1624,8 @@ bool PrintObject::invalidate_state_by_config_options(
     return invalidated;
 }
 
+// Внешняя инвалидация отменяет текущую нарезку и сбрасывает зависимые этапы.
+// Изменение поддержки требует обновить модельные линии, использующие её контакт.
 bool PrintObject::invalidate_step(PrintObjectStep step)
 {
 	bool invalidated = Inherited::invalidate_step(step);
@@ -1615,6 +1645,8 @@ bool PrintObject::invalidate_step(PrintObjectStep step)
         m_slicing_params.valid = false;
     } else if (step == posSupportMaterial) {
         invalidated |= this->invalidate_steps({ posSimplifySupportPath });
+        // Контакт изменяет и периметры, и заполнение. Обратной зависимости от периметров к поддержке нет.
+        invalidated |= this->invalidate_step(posPerimeters);
         invalidated |= m_print->invalidate_steps({ psSkirtBrim });
         m_slicing_params.valid = false;
     }
@@ -1648,6 +1680,8 @@ bool PrintObject::invalidate_all_steps()
 // stBottom       - Part of a region, which is not supported by the same region, but it is supported either by another region, or by a soluble interface layer.
 // stInternal     - Part of a region, which is supported by the same region type.
 // If a part of a region is of stBottom and stTop, the stBottom wins.
+// В окончательном проходе при нулевом зазоре нижние поверхности разделяются по реальной опоре,
+// независимо от режима поддержки и `bridge_no_support`. Подготовительный проход нужен самой генерации поддержки.
 void PrintObject::detect_surfaces_type()
 {
     BOOST_LOG_TRIVIAL(info) << "Detecting solid surfaces..." << log_memory_info();
@@ -1660,6 +1694,8 @@ void PrintObject::detect_surfaces_type()
     bool spiral_mode      = this->print()->config().spiral_mode.value;
     bool interface_shells = ! spiral_mode && m_config.interface_shells.value;
     size_t num_layers     = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
+    const bool support_contacts_ready = has_support() && m_config.support_top_z_distance.value == 0. &&
+                                        is_step_done(posSupportMaterial);
 
     for (size_t region_id = 0; region_id < this->num_printing_regions(); ++ region_id) {
         BOOST_LOG_TRIVIAL(debug) << "Detecting solid surfaces for region " << region_id << " in parallel - start";
@@ -1681,13 +1717,9 @@ void PrintObject::detect_surfaces_type()
             		((num_layers > 1) ? num_layers - 1 : num_layers) :
             		// In non-spiral vase mode, go over all layers.
             		m_layers.size()),
-            [this, region_id, interface_shells, &surfaces_new](const tbb::blocked_range<size_t>& range) {
-                // If we have soluble support material, don't bridge. The overhang will be squished against a soluble layer separating
-                // the support from the print.
-                // BBS: the above logic only applys for normal(auto) support. Complete logic:
-                // 1. has support, top z distance=0 (soluble material), auto support
-                // 2. for normal(auto), bridge_no_support is off
-                // 3. for tree(auto), interface top layers=0, max bridge length=0, support_critical_regions_only=false (only in this way the bridge is fully supported)
+            [this, region_id, interface_shells, support_contacts_ready, &surfaces_new](const tbb::blocked_range<size_t>& range) {
+                // Подготовительный проход сохраняет штатную оценку, необходимую генераторам поддержки.
+                // При готовом контакте окончательная классификация ниже не использует эту глобальную оценку.
                 bool bottom_is_fully_supported = this->has_support() && m_config.support_top_z_distance.value == 0 && is_auto(m_config.support_type.value);
                 if (m_config.support_type.value == stNormalAuto)
                     bottom_is_fully_supported &= !m_config.bridge_no_support.value;
@@ -1742,12 +1774,15 @@ void PrintObject::detect_surfaces_type()
                             surface_type_bottom_other);
 #else
                         // Any surface lying on the void is a true bottom bridge (an overhang)
-                        surfaces_append(
-                            bottom,
-                            opening_ex(
-                                diff_ex(layerm_slices_surfaces, lower_layer->lslices, ApplySafetyOffset::Yes),
-                                offset),
-                            surface_type_bottom_other);
+                        ExPolygons overhang = opening_ex(
+                            diff_ex(layerm_slices_surfaces, lower_layer->lslices, ApplySafetyOffset::Yes), offset);
+                        if (support_contacts_ready) {
+                            ExPolygons supported = intersection_ex(overhang, layer->support_contact);
+                            surfaces_append(bottom, diff_ex(overhang, supported), stBottomBridge);
+                            surfaces_append(bottom, std::move(supported), stBottom);
+                        } else {
+                            surfaces_append(bottom, std::move(overhang), surface_type_bottom_other);
+                        }
                         // if user requested internal shells, we need to identify surfaces
                         // lying on other slices not belonging to this region
                         if (interface_shells) {

@@ -1,6 +1,9 @@
 #ifndef slic3r_PrintBase_hpp_
 #define slic3r_PrintBase_hpp_
 
+// Состояния этапов печати, предупреждения и синхронизация фоновой нарезки с внешней отменой.
+// Внутренний пересчёт завершённых этапов отделён от внешней инвалидации, останавливающей рабочий поток.
+
 #include "libslic3r.h"
 #include <set>
 #include <vector>
@@ -613,6 +616,15 @@ protected:
     bool            invalidate_all_steps()
         { return m_state.invalidate_all(this->cancel_callback()); }
 
+    // Только для рабочего потока между завершёнными этапами: сбрасывает результаты под блокировкой состояния,
+    // не вызывая отмену самого себя. Внешняя отмена проверяется после захвата блокировки.
+    bool            invalidate_steps_for_recompute(std::initializer_list<PrintStepEnum> steps)
+    {
+        std::lock_guard<std::mutex> lock(this->state_mutex());
+        this->throw_if_canceled();
+        return m_state.invalidate_multiple(steps.begin(), steps.end(), [](){});
+    }
+
 	bool            is_step_started_unguarded(PrintStepEnum step) const { return m_state.is_started_unguarded(step); }
 	bool            is_step_done_unguarded(PrintStepEnum step) const { return m_state.is_done_unguarded(step); }
 
@@ -656,6 +668,15 @@ protected:
         { return m_state.invalidate_all(PrintObjectBase::cancel_callback(m_print)); }
     bool            invalidate_all_steps_without_cancel()
         { return m_state.invalidate_all([](){}); }
+
+    // Только для рабочего потока после завершения параллельных задач объекта. Внешние изменения
+    // по-прежнему используют обычную инвалидацию с отменой; внутренний повтор сохраняет текущую нарезку.
+    bool            invalidate_steps_for_recompute(std::initializer_list<PrintObjectStepEnum> steps)
+    {
+        std::lock_guard<std::mutex> lock(PrintObjectBase::state_mutex(m_print));
+        this->throw_if_canceled();
+        return m_state.invalidate_multiple(steps.begin(), steps.end(), [](){});
+    }
 
     bool            is_step_started_unguarded(PrintObjectStepEnum step) const { return m_state.is_started_unguarded(step); }
     bool            is_step_done_unguarded(PrintObjectStepEnum step) const { return m_state.is_done_unguarded(step); }

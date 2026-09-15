@@ -1,6 +1,9 @@
 #ifndef slic3r_Print_hpp_
 #define slic3r_Print_hpp_
 
+// Объекты печати, их конфигурация и состояния этапов нарезки.
+// Локальный контакт поддержки является производной геометрией и не меняет формат проектов.
+
 #include "PrintBase.hpp"
 #include "Fill/FillAdaptive.hpp"
 #include "Fill/FillLightning.hpp"
@@ -516,6 +519,8 @@ public:
     static PrintObjectConfig object_config_from_model_object(const PrintObjectConfig &default_object_config, const ModelObject &object, size_t num_extruders, std::vector<int>& variant_index);
 
 private:
+    // Обновляет контакт по готовым экструзиям поддержки до параллельного расчёта линий модели.
+    void update_support_contacts();
     void make_perimeters();
     void prepare_infill();
     void infill();
@@ -1299,6 +1304,8 @@ private:
     Polygons            first_layer_islands() const;
 
     static SlicingPipelineHookFn s_slicing_pipeline_hook_fn;
+    // Повторяет модельные этапы после новой генерации поддержки без повторной генерации самой поддержки.
+    void rebuild_model_over_support(PrintObject &object, bool run_hooks);
     bool m_pipeline_plugin_active { false };
     void run_pipeline_hook(SlicingPipelineStepPlugin step, const PrintObject* object) {
         if (m_pipeline_plugin_active && s_slicing_pipeline_hook_fn)

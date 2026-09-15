@@ -1,3 +1,5 @@
+// Координация нарезки, её зависимостей и результатов для экспорта G-code.
+// При нулевом зазоре окончательные линии модели используют уже сформированную поддержку.
 #ifdef _WIN32
 // Keep this first. A header below reaches boost/regex, whose w32_regex_traits
 // needs the Win32 types declared already.
@@ -2291,6 +2293,40 @@ std::map<ObjectID, unsigned int> getObjectExtruderMap(const Print& print) {
 }
 
 // Slicing process, running at a background thread.
+// Выполняет один окончательный проход модельных этапов по готовой поддержке.
+// Поддержка не генерируется повторно: её выбор остаётся независимым от новой классификации линий.
+// Инвалидация сохраняет готовые сечения и поддержку, но удаляет зависимость от прежних стенок и заполнения.
+// Если плагины активны, повторно вычисленные этапы снова передаются им до дальнейшего потребления результатов.
+void Print::rebuild_model_over_support(PrintObject &object, bool run_hooks)
+{
+    if (!object.has_support() || object.config().support_top_z_distance.value != 0. || object.layer_count() < 2)
+        return;
+
+    this->throw_if_canceled();
+    // Обычная инвалидация вызывает GUI-отмену фоновой нарезки и здесь остановила бы сам рабочий поток.
+    object.invalidate_steps_for_recompute({posPerimeters, posPrepareInfill, posInfill, posIroning, posContouring,
+        posSimplifyPath, posSimplifyInfill, posEstimateCurledExtrusions, posDetectOverhangsForLift});
+    this->invalidate_steps_for_recompute({psSkirtBrim, psWipeTower, psGCodeExport});
+
+    auto recompute = [this, &object, run_hooks](auto method, PrintObjectStep step, SlicingPipelineStepPlugin hook) {
+        (object.*method)();
+        if (run_hooks && object.is_step_done(step))
+            run_pipeline_hook(hook, &object);
+    };
+    recompute(&PrintObject::make_perimeters, posPerimeters, SlicingPipelineStepPlugin::posPerimeters);
+    recompute(&PrintObject::estimate_curled_extrusions, posEstimateCurledExtrusions,
+              SlicingPipelineStepPlugin::posEstimateCurledExtrusions);
+    recompute(&PrintObject::prepare_infill, posPrepareInfill, SlicingPipelineStepPlugin::posPrepareInfill);
+    recompute(&PrintObject::infill, posInfill, SlicingPipelineStepPlugin::posInfill);
+    recompute(&PrintObject::ironing, posIroning, SlicingPipelineStepPlugin::posIroning);
+    if (object.need_z_contouring())
+        recompute(&PrintObject::contour_z, posContouring, SlicingPipelineStepPlugin::posContouring);
+    else if (object.set_started(posContouring))
+        object.set_done(posContouring);
+}
+
+// Выполняет зависимые этапы нарезки и публикует только окончательные экструзии.
+// После новой поддержки без зазора модельные этапы повторяются один раз; кэш готовой поддержки не сбрасывается.
 void Print::process(long long *time_cost_with_cache, bool use_cache)
 {
     long long start_time = 0, end_time = 0;
@@ -2507,9 +2543,8 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
         // SlicingPipeline: support runs in the parallel block below; the hook must fire in a
         // sequential loop afterward. Snapshot per-object done-state just before the parallel_for.
         std::vector<char> sup_was_done(m_objects.size(), 1);
-        if (m_pipeline_plugin_active)
-            for (size_t i = 0; i < m_objects.size(); ++i)
-                sup_was_done[i] = m_objects[i]->is_step_done(posSupportMaterial) ? 1 : 0;
+        for (size_t i = 0; i < m_objects.size(); ++i)
+            sup_was_done[i] = m_objects[i]->is_step_done(posSupportMaterial) ? 1 : 0;
 
         tbb::parallel_for(tbb::blocked_range<int>(0, int(m_objects.size())),
             [this, need_slicing_objects](const tbb::blocked_range<int>& range) {
@@ -2526,11 +2561,13 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
             }
         );
 
-        if (m_pipeline_plugin_active)
-            for (size_t i = 0; i < m_objects.size(); ++i)
-                if (need_slicing_objects.count(m_objects[i]) != 0 && !sup_was_done[i]
-                    && m_objects[i]->is_step_done(posSupportMaterial))
-                    run_pipeline_hook(SlicingPipelineStepPlugin::posSupportMaterial, m_objects[i]);
+        for (size_t i = 0; i < m_objects.size(); ++i) {
+            if (need_slicing_objects.count(m_objects[i]) != 0 && !sup_was_done[i]
+                && m_objects[i]->is_step_done(posSupportMaterial)) {
+                run_pipeline_hook(SlicingPipelineStepPlugin::posSupportMaterial, m_objects[i]);
+                rebuild_model_over_support(*m_objects[i], true);
+            }
+        }
 
         for (PrintObject* obj : m_objects) {
             if (need_slicing_objects.count(obj) != 0) {
@@ -2561,6 +2598,8 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
                     obj->set_done(posContouring);
                 if (obj->set_started(posSupportMaterial))
                     obj->set_done(posSupportMaterial);
+                // Контакт не сериализуется отдельно: восстанавливаем его по кэшированным линиям поддержки.
+                obj->update_support_contacts();
                 if (obj->set_started(posDetectOverhangsForLift))
                     obj->set_done(posDetectOverhangsForLift);
             }
@@ -2569,6 +2608,7 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
                 obj->infill();
                 obj->ironing();
                 obj->generate_support_material();
+                rebuild_model_over_support(*obj, false);
                 obj->detect_overhangs_for_lift();
                 obj->estimate_curled_extrusions();
             }

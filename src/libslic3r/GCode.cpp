@@ -1,3 +1,5 @@
+// Экспорт траекторий и настроек печати в G-code с учётом потоков, скоростей и охлаждения.
+// Над поддержкой без зазора локальный предел скорости не включает прочие настройки первого слоя.
 #include "BoundingBox.hpp"
 #include "Config.hpp"
 #include "GCodeWriter.hpp"
@@ -7818,6 +7820,8 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double 
     return res;
 }
 
+// Выводит путь с его штатным потоком, ускорением и охлаждением. Дополнительные пределы скорости
+// применяются после выбора режима; контакт поддержки может разделять путь без изменения остальных параметров.
 std::string GCode::_extrude(const ExtrusionPath &path, std::string description, double speed)
 {
     std::string gcode;
@@ -8208,6 +8212,21 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                         point.speed = speed;
                 variable_speed = new_points.size() > 1;
             }
+    }
+
+    bool support_speed_limited = false;
+    if (m_layer != nullptr && path.mm3_per_mm > 0. && !path.is_force_no_extrusion() &&
+        (is_perimeter(path.role()) || is_infill(path.role()) || path.role() == erGapFill)) {
+        const double limit = is_perimeter(path.role()) ? NOZZLE_CONFIG(initial_layer_speed) :
+                                                        NOZZLE_CONFIG(initial_layer_infill_speed);
+        if (limit > 0. && speed > limit && !m_layer->support_contact.empty()) {
+            // Не возвращаем ранее отброшенные микроколебания скорости; оценку охлаждения сохраняем.
+            if (!variable_speed)
+                new_points.clear();
+            support_speed_limited = m_extrusion_quality_estimator.limit_speed_over_support(
+                *m_layer, path, float(speed), float(limit), new_points);
+            variable_speed |= support_speed_limited;
+        }
     }
 
     double F = speed * 60;  // convert mm/sec to mm/min
@@ -8727,7 +8746,13 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             
             // Ignore small speed variations - emit speed change if the delta between current and new is greater than 60mm/min / 1mm/sec
             // Reset speed to F if delta to F is less than 1mm/sec
-            if ((std::abs(last_set_speed - new_speed) > 60)) {
+            if (support_speed_limited) {
+                // Предел над поддержкой строгий: штатный допуск 1 мм/с не должен повышать его до F.
+                if (std::abs(last_set_speed - new_speed) > EPSILON) {
+                    gcode += m_writer.set_speed(new_speed, "", comment);
+                    last_set_speed = new_speed;
+                }
+            } else if ((std::abs(last_set_speed - new_speed) > 60)) {
                 gcode += m_writer.set_speed(new_speed, "", comment);
                 last_set_speed = new_speed;
             } else if ((std::abs(F - new_speed) <= 60)) {
@@ -8737,7 +8762,9 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             auto dE = e_per_mm * line_length;
             if (_needSAFC(path)) {
                 auto oldE = dE;
-                dE = m_small_area_infill_flow_compensator->modify_flow(line_length, dE, path.role());
+                // Разделение для скорости не должно превращать длинную линию в несколько малых областей.
+                const double flow_length = pre_processed_point.flow_length > 0. ? pre_processed_point.flow_length : line_length;
+                dE = m_small_area_infill_flow_compensator->modify_flow(flow_length, dE, path.role());
 
                 if (m_config.gcode_comments && oldE > 0 && oldE != dE) {
                     tempDescription += Slic3r::format(" | Old Flow Value: %0.5f Length: %0.5f",oldE, line_length);
