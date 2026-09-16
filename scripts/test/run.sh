@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Публичная обёртка контейнерных тестов; сначала нужна сборка `scripts/build.sh -t`.
+# Публичная обёртка контейнерных тестов; образ подготавливает `scripts/build.sh -t`.
 # Первый аргумент выбирает набор (по умолчанию fff_print); остальные передаются Catch2.
-# Набор all использует штатный run_unit_tests.sh и не принимает аргументы Catch2.
+# Набор all использует штатный run_unit_tests.sh. Набор version проверяет метаданные
+# сборки без компиляции приложения; оба набора не принимают аргументы Catch2.
+# Для version флаг --appimage дополнительно запускает готовый AppImage с --help,
+# без GUI и с изолированными пользовательскими каталогами внутри контейнера.
 #
-# Нужны Bash, Docker/Podman, GNU-утилиты и настроенная Release-сборка в build/.
+# Нужны Bash, Docker/Podman, GNU-утилиты; кроме version, нужна Release-сборка в build/.
 # ORCA_CONTAINER_CLI и ORCA_DOCKER_* выбирают образ как в build_linux.sh;
 # CMAKE_BUILD_PARALLEL_LEVEL задаёт число задач сборки, ORCA_TEST_TIMEOUT — секунды теста.
 # Скрипт пишет результаты сборки/тестов в проект и полные логи в новый временный каталог.
@@ -18,9 +21,18 @@ if (($#)); then shift; fi
 suites=(fff_print libslic3r libnest2d slic3rutils sla_print filament_group)
 case "$suite" in
     fff_print|libslic3r|libnest2d|slic3rutils|sla_print|filament_group) targets=("${suite}_tests") ;;
+    version)
+        check_appimage=OFF
+        if (($# == 1)) && [[ "$1" == --appimage ]]; then check_appimage=ON; shift; fi
+        if (($#)); then
+            printf 'Набор version принимает только необязательный флаг --appimage.\n' >&2
+            exit 2
+        fi
+        targets=()
+        ;;
     all)
         if (($#)); then
-            printf 'Набор all не принимает аргументы Catch2.\n' >&2
+            printf 'Набор %s не принимает аргументы Catch2.\n' "$suite" >&2
             exit 2
         fi
         targets=("${suites[@]/%/_tests}")
@@ -34,7 +46,7 @@ if [[ ! "$jobs" =~ ^[1-9][0-9]*$ || ! "$test_timeout" =~ ^[1-9][0-9]*$ ]]; then
     printf 'Параллелизм и тайм-аут должны быть положительными целыми числами.\n' >&2
     exit 2
 fi
-if [[ ! -f "$repo_root/build/CMakeCache.txt" ]]; then
+if [[ "$suite" != version && ! -f "$repo_root/build/CMakeCache.txt" ]]; then
     printf 'Нет настроенной сборки. Сначала запусти scripts/build.sh -t.\n' >&2
     exit 2
 fi
@@ -70,10 +82,16 @@ container_root=/__w/OrcaSlicer/OrcaSlicer
 # Аргументы передаются массивом напрямую, без eval и сборки shell-команды из данных.
 container=("$container_cli" run --rm --pull=never --network=none --user "$(id -u):$(id -g)"
     -v "$repo_root:$container_root" -w "$container_root" "$runner_image")
-"${container[@]}" cmake --build build --config Release --target "${targets[@]}" --parallel "$jobs" \
-    2>&1 | tee "$log_dir/build.log"
+if ((${#targets[@]})); then
+    "${container[@]}" cmake --build build --config Release --target "${targets[@]}" --parallel "$jobs" \
+        2>&1 | tee "$log_dir/build.log"
+fi
 
-if [[ "$suite" == all ]]; then
+if [[ "$suite" == version ]]; then
+    # Изолированные Git-репозитории живут только в /tmp удаляемого контейнера.
+    test_command=(cmake -DTEST_ROOT=/tmp/orcaslicer-version-tests "-DCHECK_APPIMAGE=$check_appimage"
+        -P scripts/test/version.cmake)
+elif [[ "$suite" == all ]]; then
     test_command=(scripts/run_unit_tests.sh build/tests Release)
 else
     if (($# == 0)); then set -- '~[NotWorking]'; fi
