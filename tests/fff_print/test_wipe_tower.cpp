@@ -1,5 +1,9 @@
+// Проверки геометрии и экспорта башни, включая разделение её заполнения и продувки при смене материала.
+// Модели и настройки задаются в памяти; проверка параметров сброса не моделирует прошивку принтера.
 #include <catch2/catch_all.hpp>
 
+#include <cmath>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -170,6 +174,68 @@ static std::string slice_with_prime_tower(const DynamicPrintConfig &config)
     init_print({ cube(10) }, print, model, config);
     print.apply(model, config);
     return gcode(print);
+}
+
+// Два филамента меняются в каждом слое обычной модели; рядом есть объект, выделенный для продувки.
+// Один филамент отмечен материалом поддержки, продувка в заполнение и поддержку также разрешена.
+// Параметры блока смены должны получить весь расчётный сброс за вычетом загрузки, независимо от башни.
+TEST_CASE("Продувка материала поддержки передаётся в сброс в обоих направлениях", "[WipeTower][SupportFlushing][Regression]")
+{
+    const double multiplier = GENERATE(1., 0.5);
+    CAPTURE(multiplier);
+    DynamicPrintConfig config = wipe_tower_toolchange_config("marlin");
+    config.set_deserialize_strict({
+        {"filament_is_support", "0,1"}, {"filament_soluble", "0,0"},
+        {"flush_volumes_matrix", "0,800,800,0"}, {"grab_length", "17.4"},
+        {"flush_multiplier", std::to_string(multiplier)},
+        {"prime_volume_mode", "Default"}, {"flush_into_infill", "1"},
+        {"flush_into_objects", "1"}, {"flush_into_support", "1"},
+        {"single_extruder_multi_material", "1"}, {"use_relative_e_distances", "0"}, {"gcode_comments", "1"}
+    });
+    // Наблюдаем реальные параметры шаблона после планирования продувки и формирования G-code.
+    // Комментарий не добавляет экструзий, а T-команда сохраняет штатную смену филамента в экспорте.
+    config.set_key_value("change_filament_gcode", new ConfigOptionString(
+        "; FORK_PURGE {previous_extruder} {next_extruder} {flush_length} "
+        "{flush_length_1 + flush_length_2 + flush_length_3 + flush_length_4}\nT[next_extruder]\n"));
+    Model model;
+    Print print;
+    print.is_BBL_printer() = true;
+    // Нужна хотя бы одна обычная модель: один только объект для продувки не задаёт смен материалов.
+    const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides = {
+        {{"flush_into_objects", "0"}}, {}
+    };
+    init_print(std::vector<TriangleMesh>{cube(3), cube(3)}, print, model, config, &overrides);
+    print.apply(model, config);
+    const std::string output = gcode(print);
+    REQUIRE(print.has_wipe_tower());
+    REQUIRE(print.wipe_tower_type() == WipeTowerType::Type1);
+    REQUIRE(print.extruders(true).size() == 2);
+    REQUIRE_FALSE(print.wipe_tower_data().tool_changes.empty());
+
+    const double expected_volume = 800. * multiplier - 17.4 * 2.4;
+    const double filament_area = std::acos(-1.) * 1.75 * 1.75 / 4.;
+    bool to_support = false;
+    bool from_support = false;
+    std::istringstream lines(output);
+    for (std::string line; std::getline(lines, line);) {
+        const std::string prefix = "; FORK_PURGE ";
+        if (line.compare(0, prefix.size(), prefix) != 0)
+            continue;
+        int from = -1, to = -1;
+        double length = 0., portions = 0.;
+        std::istringstream values(line.substr(prefix.size()));
+        REQUIRE(static_cast<bool>(values >> from >> to >> length >> portions));
+        if (from == 0 && to == 1)
+            to_support = true;
+        else if (from == 1 && to == 0)
+            from_support = true;
+        else
+            continue; // Начальная загрузка не является переходом между двумя филаментами.
+        CHECK_THAT(length * filament_area, Catch::Matchers::WithinAbs(expected_volume, 0.02));
+        CHECK_THAT(portions * filament_area, Catch::Matchers::WithinAbs(expected_volume, 0.02));
+    }
+    CHECK(to_support);
+    CHECK(from_support);
 }
 
 TEST_CASE("The wipe tower's toolchange planner flush follows the gcode flavor", "[WipeTower]")
