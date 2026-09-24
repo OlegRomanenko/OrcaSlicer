@@ -5,12 +5,18 @@ set -euo pipefail
 # с отдельными HOME, XDG-каталогами, D-Bus и --datadir. Нужны xvfb-run, Xvfb,
 # xwininfo, dbus-run-session, setsid, timeout и GNU-утилиты; сеть приложения не изолируется.
 # SSL_CERT_FILE сохраняется; если он не задан, используется существующий системный CA-файл.
+#
 # --appimage PATH выбирает пакет; по умолчанию в build/ должен быть ровно один AppImage.
 # --remote HOST копирует пакет и этот помощник в новый /tmp-каталог SSH-хоста;
 # установленное приложение и рабочие пользовательские каталоги не используются.
+# --presets дополнительно открывает и переключает диалоги сохранения через
+# gui_presets.py; для него нужны Python 3, PyGObject и системный AT-SPI. Начальная
+# конфигурация с комплектными профилями создаётся только в каталоге теста.
+#
 # Процессы теста останавливаются при выходе, временные файлы и полные логи сохраняются.
 # Код 0 означает показ главного окна и пять успешных проверок работающего процесса;
-# код 1 — сбой запуска/ресурсов, код 2 — неверные аргументы или отсутствие инструментов.
+# При --presets код 0 также требует прохождения сценария диалогов.
+# Код 1 — сбой запуска/сценария, код 2 — неверные аргументы или отсутствие инструментов.
 
 self=$(realpath -- "${BASH_SOURCE[0]}")
 
@@ -31,8 +37,9 @@ stop_app() {
 
 # Выполняется только внутри нового Xvfb и D-Bus. Маркер после MainFrame::Show
 # исключает ложный успех по заставке; окно и живой процесс проверяются дополнительно.
+# Третий аргумент включает сценарий диалогов; его ошибки и завершение приложения не скрываются.
 check_display() {
-    local appimage=$1 work=$2 ready=0
+    local appimage=$1 work=$2 presets=$3 ready=0
     ulimit -c 0
     cd -- "$work/run"
     app_pid=
@@ -58,6 +65,17 @@ check_display() {
             ready=$((ready + 1))
             if ((ready == 5)); then
                 printf 'Главное окно показано, процесс работает, ошибок загрузки изображений нет. Логи: %s\n' "$work"
+                if ((presets)); then
+                    if ! python3 "$(dirname -- "$self")/gui_presets.py" --work "$work" --group "$app_pid"; then
+                        if ! kill -0 "$app_pid" 2>/dev/null; then
+                            local app_result=0
+                            wait "$app_pid" || app_result=$?
+                            printf 'Тестовое приложение завершилось с кодом %s.\n' "$app_result" >&2
+                        fi
+                        return 1
+                    fi
+                    printf 'Диалоги сохранения прошли GUI-регрессию. Логи: %s\n' "$work"
+                fi
                 return 0
             fi
         else
@@ -71,15 +89,16 @@ check_display() {
 
 # Служебный вход получает только созданный внешним запуском временный каталог.
 if [[ "${1:-}" == --display ]]; then
-    if (($# != 3)) || [[ ! -d "$3" || ! -x "$2" || -z "${DISPLAY:-}" ]]; then exit 2; fi
-    check_display "$2" "$3"
+    if (($# != 4)) || [[ ! -d "$3" || ! -x "$2" || -z "${DISPLAY:-}" || ! "$4" =~ ^[01]$ ]]; then exit 2; fi
+    check_display "$2" "$3" "$4"
     stop_app
     exit 0
 fi
 
-remote='' appimage=''
+remote='' appimage='' presets=0
 while (($#)); do
     case "$1" in
+        --presets) presets=1; shift ;;
         --remote|--appimage)
             if (($# < 2)); then printf 'Для %s нужно значение.\n' "$1" >&2; exit 2; fi
             if [[ "$1" == --remote ]]; then remote=$2; else appimage=$2; fi
@@ -115,13 +134,19 @@ if [[ -n "$remote" ]]; then
     fi
     printf 'Пакет и помощник: %s:%s\n' "$remote" "$remote_dir"
     scp -p "${ssh_options[@]}" -- "$self" "$remote:$remote_dir/gui.sh"
+    preset_option=''
+    if ((presets)); then
+        scp -p "${ssh_options[@]}" -- "$(dirname -- "$self")/gui_presets.py" "$remote:$remote_dir/gui_presets.py"
+        preset_option=' --presets'
+    fi
     scp -p "${ssh_options[@]}" -- "$appimage" "$remote:$remote_dir/OrcaSlicer.AppImage"
     digest=$(sha256sum -- "$appimage")
     digest=${digest%% *}
-    # Подстановка на клиенте намеренная: digest получен из sha256sum, remote_dir проверен выше.
+    # Подстановка на клиенте намеренная: digest получен из sha256sum, remote_dir проверен выше,
+    # а preset_option содержит только фиксированный флаг либо пустую строку.
     # shellcheck disable=SC2029
     ssh "${ssh_options[@]}" "$remote" \
-        "printf '%s  %s\\n' '$digest' '$remote_dir/OrcaSlicer.AppImage' | sha256sum -c - && bash '$remote_dir/gui.sh' --appimage '$remote_dir/OrcaSlicer.AppImage'"
+        "printf '%s  %s\\n' '$digest' '$remote_dir/OrcaSlicer.AppImage' | sha256sum -c - && bash '$remote_dir/gui.sh' --appimage '$remote_dir/OrcaSlicer.AppImage'$preset_option"
     exit $?
 fi
 
@@ -130,6 +155,10 @@ for tool in Xvfb xvfb-run xwininfo dbus-run-session setsid timeout; do
         printf 'Для изолированной GUI-проверки нужен %s.\n' "$tool" >&2; exit 2
     fi
 done
+if ((presets)) && ! command -v python3 >/dev/null; then
+    printf 'Для сценария --presets нужен Python 3 с PyGObject и AT-SPI.\n' >&2
+    exit 2
+fi
 work=$(mktemp -d "${TMPDIR:-/tmp}/orcaslicer-gui.XXXXXXXX")
 printf 'Логи GUI-проверки: %s\n' "$work"
 sha256sum -- "$appimage" >"$work/appimage.sha256"
@@ -147,9 +176,15 @@ if [[ -z "${SSL_CERT_FILE:-}" && -f /etc/ssl/certs/ca-certificates.crt ]]; then
     export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 fi
 unset WAYLAND_DISPLAY
-if timeout --signal=TERM --kill-after=10s 90s xvfb-run -a -e "$work/xvfb.log" \
+test_timeout=90
+if ((presets)); then
+    export NO_AT_BRIDGE=0 LANG=C.UTF-8 LC_ALL=C.UTF-8
+    python3 "$(dirname -- "$self")/gui_presets.py" --work "$work" --prepare
+    test_timeout=240
+fi
+if timeout --signal=TERM --kill-after=10s "${test_timeout}s" xvfb-run -a -e "$work/xvfb.log" \
     -s '-screen 0 1600x1000x24 -nolisten tcp' \
-    dbus-run-session -- bash "$self" --display "$appimage" "$work" 2>&1 | tee "$work/test.log"; then
+    dbus-run-session -- bash "$self" --display "$appimage" "$work" "$presets" 2>&1 | tee "$work/test.log"; then
     exit 0
 else
     result=$?

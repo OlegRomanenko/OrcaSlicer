@@ -177,8 +177,13 @@ SavePresetDialog::Item::Item(Preset::Type type, const std::string &suffix, wxBox
         detach_label->Bind(wxEVT_LEFT_DCLICK, [on_toggle](wxMouseEvent& e) {on_toggle();});
     }
     
-    m_radio_group->Bind(wxEVT_COMMAND_RADIOBOX_SELECTED, [this](wxCommandEvent &e) {
-        m_save_to_project = m_radio_group->GetSelection() == 1;
+    m_radio_group->Bind(wxEVT_COMMAND_RADIOBOX_SELECTED, [this](wxCommandEvent &) {
+        const bool save_to_project = m_radio_group->GetSelection() == 1;
+        // SetSelection синхронно посылает событие даже для прежнего значения.
+        // Программная синхронизация из update() не должна повторно запускать проверку.
+        if (m_save_to_project == save_to_project)
+            return;
+        m_save_to_project = save_to_project;
         update();
     });
 
