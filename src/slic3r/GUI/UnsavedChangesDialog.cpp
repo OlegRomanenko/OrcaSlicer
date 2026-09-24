@@ -1,3 +1,5 @@
+// Показывает различия профилей и собирает решение о сохранении, переносе или отмене изменений.
+// Диалог передаёт имя, тип сохранения и `detach` вызывающему коду; перенос без сохранения не меняет эти связи.
 #include "UnsavedChangesDialog.hpp"
 
 #include <cstddef>
@@ -826,6 +828,8 @@ UnsavedChangesDialog::UnsavedChangesDialog(Preset::Type type, PresetCollection *
 }
 
 
+// Запомненное действие используется для пакетного диалога. Оно не заменяет сбор имён и параметров:
+// вызывающий код сохраняет именно `names_and_types`. Отмена вложенного диалога отменяет весь переход.
 inline int UnsavedChangesDialog::ShowModal()
 {
     auto choise_key = "save_preset_choise"; 
@@ -833,6 +837,10 @@ inline int UnsavedChangesDialog::ShowModal()
     long result = 0;
     if ((m_buttons & REMEMBER_CHOISE) && !choise.empty() && wxString(choise).ToLong(&result) && (1 << result) & (m_buttons | DONT_SAVE)) {
         m_exit_action = Action(result);
+        const bool prepare_presets = m_exit_action == Action::Save ||
+            (m_exit_action == Action::Transfer && (m_buttons & ActionButtons::KEEP));
+        if (prepare_presets && !save(nullptr, m_exit_action == Action::Save))
+            return wxID_CANCEL;
         return 0;
     }
     int r = DPIDialog::ShowModal();
@@ -1130,6 +1138,9 @@ void UnsavedChangesDialog::close(Action action)
     this->EndModal(wxID_CLOSE);
 }
 
+// Собирает параметры одного или всех изменённых профилей без записи конфигурации.
+// При сохранении пластика или FFF-печати открывает выбор даже для прежнего имени; при переносе без сохранения
+// (`show_save_preset_dialog == false`) не вводит новый диалог и не отсоединяет профиль. Отмена возвращает `false`.
 bool UnsavedChangesDialog::save(PresetCollection* dependent_presets, bool show_save_preset_dialog/* = true*/)
 {
     names_and_types.clear();
@@ -1138,11 +1149,13 @@ bool UnsavedChangesDialog::save(PresetCollection* dependent_presets, bool show_s
     if (dependent_presets) {
         const Preset& preset = dependent_presets->get_edited_preset();
         std::string name = preset.name;
+        const std::string source_name = preset.name;
 
         // for system/default/external presets we should take an edited name
         //BBS: add project embedded preset logic and refine is_external
-        bool save_to_project = false;
-        if (!preset.can_overwrite()) {
+        bool save_to_project = preset.is_project_embedded;
+        bool detach = false;
+        if (!preset.can_overwrite() || (show_save_preset_dialog && Preset::uses_project_namespace(preset.type))) {
         //if (preset.is_system || preset.is_default || preset.is_external) {
             SavePresetDialog save_dlg(this, preset.type);
             if (save_dlg.ShowModal() != wxID_OK) {
@@ -1151,10 +1164,11 @@ bool UnsavedChangesDialog::save(PresetCollection* dependent_presets, bool show_s
             }
             name = save_dlg.get_name();
             save_to_project = save_dlg.get_save_to_project_selection(preset.type);
+            detach = save_dlg.get_detach_value(preset.type);
         }
 
         //BBS: add project embedded preset relate logic
-        PresetData preset_data(name, preset.type, save_to_project);
+        PresetData preset_data(name, preset.type, save_to_project, detach, source_name);
         names_and_types.emplace_back(preset_data);
         //names_and_types.emplace_back(make_pair(name, preset.type));
     }
@@ -1169,7 +1183,7 @@ bool UnsavedChangesDialog::save(PresetCollection* dependent_presets, bool show_s
             if (tab->supports_printer_technology(printer_technology) && tab->current_preset_is_dirty()) {
                 const Preset& preset = tab->get_presets()->get_edited_preset();
                 //BBS: add project embedded preset logic and refine is_external
-                if (!preset.can_overwrite())
+                if (!preset.can_overwrite() || Preset::uses_project_namespace(preset.type))
                 //if (preset.is_system || preset.is_default || preset.is_external)
                     types_for_save.emplace_back(preset.type);
 
@@ -1190,9 +1204,11 @@ bool UnsavedChangesDialog::save(PresetCollection* dependent_presets, bool show_s
             //BBS: add project embedded preset relate logic
             for (PresetData& nt : names_and_types) {
                 const std::string& name = save_dlg.get_name(nt.type);
-                if (!name.empty())
-                    nt.name = name;
+                if (name.empty())
+                    continue;
+                nt.name = name;
                 nt.save_to_project = save_dlg.get_save_to_project_selection(nt.type);
+                nt.detach = save_dlg.get_detach_value(nt.type);
             }
             //for (std::pair<std::string, Preset::Type>& nt : names_and_types) {
             //    const std::string& name = save_dlg.get_name(nt.second);

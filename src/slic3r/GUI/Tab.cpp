@@ -1,3 +1,6 @@
+// Вкладки связывают редактируемые конфигурации `PresetBundle` с wxWidgets и пересчётом интерфейса.
+// Сохранение передаёт явно выбранные тип и `detach` в коллекцию, затем обновляет совместимость и списки.
+// Глобальная совместимость профиля не относится к локальным настройкам объекта или пластины.
 // #include "libslic3r/GCodeSender.hpp"
 //#include "slic3r/Utils/Serial.hpp"
 #include "Tab.hpp"
@@ -2690,6 +2693,8 @@ void Tab::update_frequently_changed_parameters()
 }
 
 //BBS: BBS new parameter list
+// Строит страницы FFF-настроек над конфигурацией вкладки; wxWidgets владеет созданными элементами.
+// `TabPrintModel` также вызывает этот метод, поэтому управление совместимостью создаётся только для `TYPE_PRINT`.
 void TabPrint::build()
 {
     if (m_presets == nullptr)
@@ -3198,19 +3203,18 @@ void TabPrint::build()
         option.opt.height = 25;//250;
         optgroup->append_single_option_line(option, "others_settings_notes");
 
-    // Orca: hide the dependencies tab for process for now. The UI is not ready yet.
-    // page = add_options_page(L("Dependencies"), "param_profile_dependencies"); // icons ready
-    //     optgroup = page->new_optgroup(L("Profile dependencies"), "param_profile_dependencies"); // icons ready
-
-    //     create_line_with_widget(optgroup.get(), "compatible_printers", "", [this](wxWindow* parent) {
-    //         return compatible_widget_create(parent, m_compatible_printers);
-    //     });
-
-    //     option = optgroup->get_option("compatible_printers_condition");
-    //     option.opt.full_width = true;
-    //     optgroup->append_single_option_line(option);
-
-    //     build_preset_description_line(optgroup.get());
+    if (m_type == Preset::TYPE_PRINT) {
+        // Страница создаётся при запуске GUI; её иконки должны входить в пакет, как у `TabFilament`.
+        page = add_options_page(L("Dependencies"), "advanced");
+        optgroup = page->new_optgroup(L("Profile dependencies"), "param_dependencies_printers");
+        create_line_with_widget(optgroup.get(), "compatible_printers", "", [this](wxWindow* parent) {
+            return compatible_widget_create(parent, m_compatible_printers);
+        });
+        option = optgroup->get_option("compatible_printers_condition");
+        option.opt.full_width = true;
+        optgroup->append_single_option_line(option);
+        build_preset_description_line(optgroup.get());
+    }
 }
 
 // Reload current config (aka presets->edited_preset->config) into the UI fields.
@@ -7019,8 +7023,8 @@ bool Tab::select_preset(
     return !canceled;
 }
 
-// If the current preset is dirty, the user is asked whether the changes may be discarded.
-// if the current preset was not dirty, or the user agreed to discard the changes, 1 is returned.
+// Запрашивает решение о несохранённых изменениях текущей или зависимой коллекции.
+// Отмена возвращает `false`; сохранение передаёт выбранные тип и `detach`, перенос сохраняет штатную логику.
 bool Tab::may_discard_current_dirty_preset(PresetCollection *presets /*= nullptr*/, const std::string &new_printer_name /*= ""*/, bool no_transfer, bool no_transfer_variant)
 {
     if (presets == nullptr) presets = m_presets;
@@ -7035,19 +7039,33 @@ bool Tab::may_discard_current_dirty_preset(PresetCollection *presets /*= nullptr
         const std::string& name = dlg.get_preset_name();
         //BBS: add project embedded preset relate logic
         bool save_to_project = dlg.get_save_to_project_option();
+        const bool detach = dlg.get_detach_option();
+        const std::string source_name = dlg.get_source_preset_name();
+        if (presets->get_edited_preset().name != source_name) {
+            GUI::show_error(this, "Выбранный профиль изменился до сохранения: " + source_name);
+            return false;
+        }
 
         if (m_type == presets->type()) // save changes for the current preset from this tab
         {
             // revert unselected options to the old values
             presets->get_edited_preset().config.apply_only(presets->get_selected_preset().config, unselected_options);
             //BBS: add project embedded preset relate logic
-            save_preset(name, false, save_to_project);
+            save_preset(name, detach, save_to_project);
+            if (presets->get_selected_preset_name() != name || presets->current_is_dirty())
+                return false;
             //save_preset(name);
         }
         else
         {
             //BBS: add project embedded preset relate logic
-            m_preset_bundle->save_changes_for_preset(name, presets->type(), unselected_options, save_to_project);
+            try {
+                m_preset_bundle->save_changes_for_preset(name, presets->type(), unselected_options,
+                    save_to_project, detach, source_name);
+            } catch (const std::runtime_error &error) {
+                GUI::show_error(this, error.what());
+                return false;
+            }
             //m_preset_bundle->save_changes_for_preset(name, presets->type(), unselected_options);
 
             // If filament preset is saved for multi-material printer preset,
@@ -7410,6 +7428,9 @@ void Tab::transfer_options(const std::string &name_from, const std::string &name
 // Wizard calls save_preset with a name "My Settings", otherwise no name is provided and this method
 // opens a Slic3r::GUI::SavePresetDialog dialog.
 //BBS: add project embedded preset relate logic
+// Проверяет конфигурацию, получает параметры из диалога либо использует явно переданные вызывающим кодом.
+// После записи обновляет метаданные синхронизации и совместимость. Отмена диалога ничего не сохраняет;
+// выбор `All` проходит в коллекцию без подмены текущим принтером.
 void Tab::save_preset(std::string name /*= ""*/, bool detach, bool save_to_project, bool from_input, std::string input_name )
 {
     // ORCA: Validate before opening any save-name UI for filament presets.
@@ -7423,12 +7444,13 @@ void Tab::save_preset(std::string name /*= ""*/, bool detach, bool save_to_proje
     if (from_input) {
         SavePresetDialog dlg(m_parent, m_type, m_mode, detach ? _u8L("Detached") : "");
         dlg.Show(false);
-        dlg.input_name_from_other(input_name);
+        dlg.input_name_from_other(input_name, save_to_project);
         wxCommandEvent evt(wxEVT_TEXT, GetId());
         dlg.GetEventHandler()->ProcessEvent(evt);
-        dlg.confirm_from_other();
-        name = input_name;
-        detach = dlg.get_detach_value(m_type);
+        if (!dlg.confirm_from_other())
+            return;
+        name = dlg.get_name();
+        // Калибровка и другие служебные вызовы сохраняют явно переданный `detach`, а не значение скрытого диалога.
     }
 
     if (name.empty()) {
@@ -7446,6 +7468,8 @@ void Tab::save_preset(std::string name /*= ""*/, bool detach, bool save_to_proje
     //BBS record current preset name
     Preset& edited_preset = m_presets->get_edited_preset();
     std::string curr_preset_name = edited_preset.name;
+    const bool cross_scope_copy = Preset::uses_project_namespace(m_type) && edited_preset.is_project_embedded != save_to_project;
+    name = m_presets->saved_preset_name(name, save_to_project);
 
     bool exist_preset = false;
     Preset* new_preset = m_presets->find_preset(name, false);
@@ -7453,28 +7477,26 @@ void Tab::save_preset(std::string name /*= ""*/, bool detach, bool save_to_proje
         exist_preset = true;
     }
 
-    // Orca: check if compatible_printers exists and is not empty, set it to the current printer if it is empty
-    // Ensures that custom filaments based on system are not accidentally allowed for all printers
-    // Can still be set for all after creation
-    if (m_presets->type() == Preset::TYPE_FILAMENT && !exist_preset && edited_preset.is_system) {
-        Preset* _curr_printer = const_cast<Preset*>(&wxGetApp().preset_bundle->printers.get_selected_preset_base());
-        ConfigOptionStrings* compatible_printers = m_config->option<ConfigOptionStrings>("compatible_printers");
-        if (nullptr != _curr_printer && compatible_printers && compatible_printers->values.empty())
-            compatible_printers->values.push_back(_curr_printer->name);
-    }
+    // Идентичность облачной записи относится к найденному назначению, а не к источнику копирования.
+    const bool create_user_preset = !exist_preset;
     // Save the preset into Slic3r::data_dir / presets / section_name / preset_name.json
-    m_presets->save_current_preset(name, detach, save_to_project, nullptr);
+    try {
+        m_presets->save_current_preset(name, detach, save_to_project, nullptr);
+    } catch (const std::runtime_error &error) {
+        GUI::show_error(this, error.what());
+        return;
+    }
 
     //BBS create new settings
     new_preset = m_presets->find_preset(name, false, true);
     //Preset* preset = &m_presets.preset(it - m_presets.begin(), true);
-    if (!new_preset) {
+    if (!new_preset || !new_preset->can_overwrite() || m_presets->get_selected_preset_name() != name) {
         BOOST_LOG_TRIVIAL(info) << "create new preset failed";
         return;
     }
 
     // set sync_info for sync service
-    if (exist_preset) {
+    if (!create_user_preset) {
         new_preset->sync_info = "update";
         BOOST_LOG_TRIVIAL(info) << "sync_preset: update preset = " << new_preset->name;
     }
@@ -7496,7 +7518,9 @@ void Tab::save_preset(std::string name /*= ""*/, bool detach, bool save_to_proje
     on_presets_changed();
 
     //BBS if create a new prset name, preset changed from preset name to new preset name
-    if (!exist_preset) {
+    // При копировании между областями `on_presets_changed` переключает только редактируемый слот.
+    // Остальные слоты должны сохранить выбранную исходную запись, а не переехать вместе с копией.
+    if (!exist_preset && !cross_scope_copy) {
         wxGetApp().plater()->sidebar().update_presets_from_to(m_type, curr_preset_name, new_preset->name);
     }
 
@@ -7737,6 +7761,8 @@ void Tab::create_line_with_widget(ConfigOptionsGroup* optgroup, const std::strin
 }
 
 // Return a callback to create a Tab widget to mark the preferences as compatible / incompatible to the current printer.
+// Создаёт общий редактор списка совместимых профилей. Список хранится в `m_config`, пустой означает `All`;
+// условие применяется отдельно при пустом списке. Обработчики живут вместе с вкладкой и её `deps`.
 wxSizer* Tab::compatible_widget_create(wxWindow* parent, PresetDependencies &deps)
 {
     deps.checkbox = new ::CheckBox(parent, wxID_ANY);
@@ -7855,12 +7881,10 @@ wxSizer* Tab::compatible_widget_create(wxWindow* parent, PresetDependencies &dep
             if(selections.GetCount() != presets.GetCount())
                 for (auto idx : selections)
                     value.push_back(presets[idx].ToUTF8().data());
-            if (value.empty()) {
-                deps.checkbox->SetValue(1);
-                deps.btn->Disable();
-            }
             // All depending_presets have been made compatible with this preset.
             this->load_key_value(deps.key_list, value);
+            // Выбор всех пунктов также возвращает `All`: обновляем и галочку, и доступность условия.
+            this->compatible_widget_reload(deps);
             this->update_changed_ui();
         }
     }));

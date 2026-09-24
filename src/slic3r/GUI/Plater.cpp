@@ -1,5 +1,7 @@
 // Рабочая область печати и её боковая панель связывают модель, настройки проекта и GUI.
 // Автоматический пересчёт продувки меняет только переходы затронутого физического филамента.
+// При загрузке проекта ссылки на вложенные профили мигрируют вместе с его конфигурацией,
+// до выбора профилей; импорт только геометрии не изменяет ссылки текущей конфигурации.
 #include "Plater.hpp"
 #include "../Utils/NetworkAgent.hpp"
 #include "libslic3r/Config.hpp"
@@ -8422,6 +8424,9 @@ void read_binary_stl(const std::string& filename, std::string& model_id, std::st
 }
 
 // BBS: backup & restore
+// Загружает геометрию и/или конфигурацию согласно `strategy`, обновляя рабочую область и выбор профилей.
+// Возвращает индексы добавленных объектов; отмену и ошибки чтения обрабатывает через диалоги.
+// `published_out` при наличии сообщает, был ли загружен опубликованный проект.
 std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_files,
                                              LoadStrategy strategy,
                                              bool ask_multi,
@@ -8936,7 +8941,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         // load project embedded presets
                         PresetsConfigSubstitutions preset_substitutions;
                         PresetBundle &             preset_bundle = *wxGetApp().preset_bundle;
-                        preset_substitutions                     = preset_bundle.load_project_embedded_presets(project_presets, ForwardCompatibilitySubstitutionRule::Enable);
+                        preset_substitutions                     = preset_bundle.load_project_embedded_presets(project_presets, ForwardCompatibilitySubstitutionRule::Enable, &config_loaded);
                         if (!preset_substitutions.empty()) show_substitutions_info(preset_substitutions);
                     }
                     if (project_presets.size() > 0) {

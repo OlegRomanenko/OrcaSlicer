@@ -1,6 +1,8 @@
 #ifndef slic3r_UnsavedChangesDialog_hpp_
 #define slic3r_UnsavedChangesDialog_hpp_
 
+// Диалоги сравнения и несохранённых изменений возвращают выбранное действие и параметры сохранения.
+// Конфигурацию записывает вызывающий код; выбранные тип сохранения и `detach` передаются вместе с именем.
 #include <wx/dataview.h>
 #include <map>
 #include <vector>
@@ -300,15 +302,19 @@ protected:
     Action m_exit_action {Action::Undef};
 
 public:
-    //BBS: add project embedded preset relate logic
+    // Полные ключи источника и назначения вместе с выбором сохранения; не являются настройками профиля.
     struct PresetData
     {
         std::string name;
+        std::string source_name;
         Preset::Type type;
         bool save_to_project;
+        bool detach;
 
-        PresetData(std::string preset_name, Preset::Type preset_type, bool save_project)
-            :name(preset_name), type(preset_type), save_to_project(save_project)
+        PresetData(std::string preset_name, Preset::Type preset_type, bool save_project, bool detach_from_parent = false,
+                   std::string source_key = {})
+            :name(preset_name), source_name(source_key.empty() ? preset_name : source_key), type(preset_type),
+             save_to_project(save_project), detach(detach_from_parent)
         {
         }
     };
@@ -365,9 +371,11 @@ public:
     //BBS: add project embedded preset relate logic
     const std::vector<UnsavedChangesDialog::PresetData>& get_names_and_types() { return names_and_types; }
     bool get_save_to_project_option() { return names_and_types[0].save_to_project; }
+    bool get_detach_option() const { return names_and_types[0].detach; }
     //const std::vector<std::pair<std::string, Preset::Type>>& get_names_and_types() { return names_and_types; }
     // short version of the previous function, for the case, when just one preset is modified
     std::string get_preset_name() { return names_and_types[0].name; }
+    const std::string &get_source_preset_name() const { return names_and_types[0].source_name; }
 
     std::vector<std::string> get_unselected_options(Preset::Type type) { /* return m_tree->options(type, false);*/return std::vector<std::string>();}
     std::vector<std::string> get_selected_options  (Preset::Type type)  {

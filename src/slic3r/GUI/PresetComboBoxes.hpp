@@ -1,6 +1,9 @@
 #ifndef slic3r_PresetComboBoxes_hpp_
 #define slic3r_PresetComboBoxes_hpp_
 
+// Виджеты выбора над коллекциями `PresetBundle`: подпись принадлежит интерфейсу,
+// а `ItemAlias` сохраняет точный ключ записи. Проектные и пользовательские копии не объединяются по подписи.
+
 //#include <wx/bmpcbox.h>
 #include <wx/colourdata.h>
 #include <wx/gdicmn.h>
@@ -105,6 +108,8 @@ public:
     virtual void OnSelect(wxCommandEvent& evt);
 
 protected:
+    // Добавляет переводимую пометку области к подписи; внутренний ключ хранится отдельно в `ItemAlias`.
+    wxString with_storage_label(const Preset &preset, const wxString &label) const;
     typedef std::size_t Marker;
     std::function<void(int)>    on_selection_changed { nullptr };
 

@@ -1,3 +1,6 @@
+// Списки связывают видимые подписи с профилями `PresetBundle`. Выбор хранит полный ключ в `ItemAlias`,
+// а имя и пометка области отображаются отдельно; это позволяет независимо выбирать одноимённые копии.
+// wxWidgets владеет элементами, коллекции профилей остаются владельцами конфигураций.
 #include "PresetComboBoxes.hpp"
 
 #include <cstddef>
@@ -345,6 +348,7 @@ wxString PresetComboBox::get_tooltip(const Preset &preset)
     return tooltip;
 }
 
+// Возвращает внутренний ключ записи, а не подпись с пометкой области; физические принтеры сохраняют свой путь выбора.
 wxString PresetComboBox::get_preset_item_name(unsigned int index)
 {
     if (m_type == Preset::TYPE_PRINTER) {
@@ -381,14 +385,27 @@ wxString PresetComboBox::get_preset_item_name(unsigned int index)
     }
 
     m_selected_dev_id.clear();
+    if (Preset::uses_project_namespace(m_type) && !GetItemAlias(index).empty())
+        return GetItemAlias(index);
     return GetString(index);
 }
 
-wxString PresetComboBox::get_preset_name(const Preset & preset)
+// Подписи самостоятельных областей различимы и вне раскрытого списка; системные и пакетные подписи не меняются.
+wxString PresetComboBox::with_storage_label(const Preset &preset, const wxString &label) const
 {
-    return from_u8(preset.name/* + suffix(preset)*/);
+    if (!Preset::uses_project_namespace(preset.type) || !preset.can_overwrite())
+        return label;
+    return label + " [" + (preset.is_project_embedded ? _L("Preset Inside Project") : _L("User Preset")) + "]";
 }
 
+// Обычный список показывает имя без служебной проектной квалификации, сохраняя область отдельной пометкой.
+wxString PresetComboBox::get_preset_name(const Preset & preset)
+{
+    return with_storage_label(preset, from_u8(preset.is_project_embedded && Preset::uses_project_namespace(preset.type) ?
+        get_preset_bare_name(preset.name) : preset.name));
+}
+
+// Перестраивает список по каноническим ключам; отображаемые подписи и ключи выбора не смешиваются.
 void PresetComboBox::update(std::string select_preset_name)
 {
     Freeze();
@@ -419,17 +436,18 @@ void PresetComboBox::update(std::string select_preset_name)
         assert(bmp);
 
         if (!is_enabled)
-            incomp_presets.emplace(get_preset_name(preset), bmp);
+            incomp_presets.emplace(from_u8(preset.name), bmp);
         else if (preset.is_default || preset.is_system)
         {
-            Append(get_preset_name(preset), *bmp);
+            const int item = Append(get_preset_name(preset), *bmp);
+            SetItemAlias(item, from_u8(preset.name));
             validate_selection(preset.name == select_preset_name);
         }
         else
         {
-            nonsys_presets.emplace(get_preset_name(preset), std::pair<wxBitmap*, bool>(bmp, is_enabled));
+            nonsys_presets.emplace(from_u8(preset.name), std::pair<wxBitmap*, bool>(bmp, is_enabled));
             if (preset.name == select_preset_name || (select_preset_name.empty() && is_enabled))
-                selected = get_preset_name(preset);
+                selected = from_u8(preset.name);
         }
         if (i + 1 == m_collection->num_default_presets())
             set_label_marker(Append(_L("System presets"), wxNullBitmap, DD_ITEM_STYLE_SPLIT_ITEM));
@@ -438,7 +456,9 @@ void PresetComboBox::update(std::string select_preset_name)
     {
         set_label_marker(Append(_L("User presets"), wxNullBitmap, DD_ITEM_STYLE_SPLIT_ITEM));
         for (std::map<wxString, std::pair<wxBitmap*, bool>>::iterator it = nonsys_presets.begin(); it != nonsys_presets.end(); ++it) {
-            int item_id = Append(it->first, *it->second.first);
+            const Preset *preset = m_collection->find_preset(into_u8(it->first), false);
+            int item_id = Append(get_preset_name(*preset), *it->second.first);
+            SetItemAlias(item_id, it->first);
             bool is_enabled = it->second.second;
             if (!is_enabled)
                 set_label_marker(item_id, LABEL_ITEM_DISABLED);
@@ -449,7 +469,10 @@ void PresetComboBox::update(std::string select_preset_name)
     {
         set_label_marker(Append(_L("Incompatible presets"), wxNullBitmap, DD_ITEM_STYLE_SPLIT_ITEM));
         for (std::map<wxString, wxBitmap*>::iterator it = incomp_presets.begin(); it != incomp_presets.end(); ++it) {
-            set_label_marker(Append(it->first, *it->second), LABEL_ITEM_DISABLED);
+            const Preset *preset = m_collection->find_preset(into_u8(it->first), false);
+            const int item = Append(get_preset_name(*preset), *it->second);
+            SetItemAlias(item, it->first);
+            set_label_marker(item, LABEL_ITEM_DISABLED);
         }
     }
 
@@ -465,7 +488,7 @@ void PresetComboBox::show_all(bool show_all)
 
 void PresetComboBox::update()
 {
-    this->update(into_u8(this->GetString(this->GetSelection())));
+    this->update(into_u8(get_preset_item_name(this->GetSelection())));
 }
 
 void PresetComboBox::update_from_bundle()
@@ -1002,6 +1025,8 @@ void PlaterPresetComboBox::update_badge_according_flag() {
     ShowBadge(ok);
 }
 
+// Открывает редактор выбранной записи. Признак несохранённых изменений читается из подписи,
+// но поиск профиля использует привязанный к строке полный ключ, включая проектную область.
 bool PlaterPresetComboBox::switch_to_tab()
 {
     Tab* tab = wxGetApp().get_tab(m_type);
@@ -1011,8 +1036,9 @@ bool PlaterPresetComboBox::switch_to_tab()
     const Preset* selected_filament_preset = nullptr;
     if (m_type == Preset::TYPE_FILAMENT)
     {
-        const std::string& selected_preset = GetString(GetSelection()).ToUTF8().data();
-        if (!boost::algorithm::starts_with(selected_preset, Preset::suffix_modified()))
+        const std::string selected_label = GetString(GetSelection()).ToUTF8().data();
+        const std::string selected_preset = get_preset_item_name(GetSelection()).ToUTF8().data();
+        if (!boost::algorithm::starts_with(selected_label, Preset::suffix_modified()))
         {
             const std::string& preset_name = wxGetApp().preset_bundle->filaments.get_preset_name_by_alias(selected_preset);
             if (wxGetApp().get_tab(m_type)->select_preset(preset_name))
@@ -1122,9 +1148,10 @@ void PlaterPresetComboBox::show_edit_menu()
     wxGetApp().plater()->PopupMenu(menu);
 }
 
+// Карточка филамента сохраняет штатный alias и признак изменения, добавляя различение областей.
 wxString PlaterPresetComboBox::get_preset_name(const Preset& preset)
 {
-    return from_u8(preset.label(false));
+    return with_storage_label(preset, from_u8(preset.label(false)));
 }
 
 // Only the compatible presets are shown.
@@ -1679,17 +1706,15 @@ void TabPresetComboBox::OnSelect(wxCommandEvent &evt)
 #endif
 }
 
+// Редактор показывает обычное имя проектной записи; канонический ключ остаётся в `ItemAlias`.
 wxString TabPresetComboBox::get_preset_name(const Preset& preset)
 {
-    if (preset.is_from_bundle())
-        return from_u8(preset.label(false));
-    else
-        return from_u8(preset.label(true));
+    const bool show_alias = preset.is_from_bundle() || (preset.is_project_embedded && Preset::uses_project_namespace(preset.type));
+    return with_storage_label(preset, from_u8(preset.label(!show_alias)));
 }
 
-// Update the choice UI from the list of presets.
-// If show_incompatible, all presets are shown, otherwise only the compatible presets are shown.
-// If an incompatible preset is selected, it is shown as well.
+// Перестраивает группы профилей редактора, привязывая каждую подпись к каноническому ключу через `ItemAlias`.
+// При выключенном `show_incompatible` скрывает несовместимые записи, кроме текущей выбранной.
 void TabPresetComboBox::update()
 {
     Freeze();
@@ -1797,7 +1822,8 @@ void TabPresetComboBox::update()
     {
         set_label_marker(Append(_L("Project-inside presets"), wxNullBitmap, DD_ITEM_STYLE_SPLIT_ITEM));
         for (std::map<wxString, std::pair<wxBitmap*, bool>>::iterator it = project_embedded_presets.begin(); it != project_embedded_presets.end(); ++it) {
-            int item_id = Append(it->first, *it->second.first);
+            int item_id = Append(from_u8(preset_aliases[it->first]), *it->second.first);
+            SetItemAlias(item_id, it->first);
             SetItemTooltip(item_id, preset_descriptions[it->first]);
             bool is_enabled = it->second.second;
             if (!is_enabled)
@@ -1809,7 +1835,7 @@ void TabPresetComboBox::update()
     {
         set_label_marker(Append(_L("User presets"), wxNullBitmap, DD_ITEM_STYLE_SPLIT_ITEM));
         for (std::map<wxString, std::pair<wxBitmap*, bool>>::iterator it = nonsys_presets.begin(); it != nonsys_presets.end(); ++it) {
-            int item_id = Append(it->first, *it->second.first);
+            int item_id = Append(from_u8(preset_aliases[it->first]), *it->second.first);
             SetItemAlias(item_id, it->first);
             SetItemTooltip(item_id, preset_descriptions[it->first]);
             bool is_enabled = it->second.second;
@@ -1906,6 +1932,7 @@ void TabPresetComboBox::msw_rescale()
     SetSize(sz);
 }
 
+// Обновляет признак изменения, не заменяя каноническую привязку строки её отображаемой подписью.
 void TabPresetComboBox::update_dirty()
 {
     // 1) Update the dirty flag of the current preset.
@@ -1920,6 +1947,8 @@ void TabPresetComboBox::update_dirty()
 
         std::string   old_label = GetString(ui_id).utf8_str().data();
         std::string   preset_name = Preset::remove_suffix_modified(old_label);
+        if (Preset::uses_project_namespace(m_type) && !GetItemAlias(ui_id).empty())
+            preset_name = into_u8(GetItemAlias(ui_id));
         std::string   ph_printer_name;
 
         if (marker == LABEL_ITEM_PHYSICAL_PRINTER) {
@@ -1929,7 +1958,7 @@ void TabPresetComboBox::update_dirty()
 
         Preset* preset = m_collection->find_preset(preset_name, false);
         if (preset) {
-            std::string new_label = preset->label(true);
+            std::string new_label = Preset::uses_project_namespace(m_type) ? into_u8(get_preset_name(*preset)) : preset->label(true);
 
             if (marker == LABEL_ITEM_PHYSICAL_PRINTER)
                 new_label = ph_printer_name + PhysicalPrinter::separator() + new_label;

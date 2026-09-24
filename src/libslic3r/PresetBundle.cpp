@@ -1,3 +1,5 @@
+// Связывает коллекции профилей, конфигурацию проекта, загрузку и совместимость выбранных настроек.
+// Файловые операции делегируются коллекциям; явные параметры сохранения не зависят от источника профиля.
 #include <cassert>
 #include <chrono>
 #include <ctime>
@@ -995,11 +997,59 @@ std::optional<FilamentBaseInfo> PresetBundle::get_filament_by_filament_id(const 
 }
 
 //BBS: load project embedded presets
-PresetsConfigSubstitutions PresetBundle::load_project_embedded_presets(std::vector<Preset*> project_presets, ForwardCompatibilitySubstitutionRule substitution_rule)
+// Восстанавливает области вложенных профилей и переводит ссылки старого проекта в канонические ключи.
+// Имена библиотеки и новые явно квалифицированные ссылки не переписываются; формат настроек принтера сохраняется.
+PresetsConfigSubstitutions PresetBundle::load_project_embedded_presets(std::vector<Preset*> project_presets,
+    ForwardCompatibilitySubstitutionRule substitution_rule, DynamicPrintConfig *project_config)
 {
     // First load the vendor specific system presets.
     PresetsConfigSubstitutions substitutions;
     std::string errors_cummulative;
+
+    std::map<std::string, std::string> print_names, filament_names;
+    for (const Preset *preset : project_presets) {
+        if (!preset->is_project_embedded || !Preset::uses_project_namespace(preset->type))
+            continue;
+        const auto &collection = preset->type == Preset::TYPE_PRINT ? prints : filaments;
+        const auto canonical = collection.saved_preset_name(preset->name, true);
+        if (canonical != preset->name)
+            (preset->type == Preset::TYPE_PRINT ? print_names : filament_names).emplace(preset->name, canonical);
+    }
+    auto remap = [](std::string &name, const std::map<std::string, std::string> &names) {
+        const auto found = names.find(name);
+        if (found != names.end())
+            name = found->second;
+    };
+    // Явные ссылки на профили печати внутри вложенных филаментов также относятся к старому проекту.
+    for (Preset *preset : project_presets)
+        if (preset->is_project_embedded)
+            if (auto *compatible = preset->config.option<ConfigOptionStrings>("compatible_prints"))
+                for (std::string &name : compatible->values)
+                    remap(name, print_names);
+    if (project_config) {
+        if (auto *print = project_config->option<ConfigOptionString>("print_settings_id"))
+            remap(print->value, print_names);
+        if (auto *filaments = project_config->option<ConfigOptionStrings>("filament_settings_id"))
+            for (std::string &name : filaments->values)
+                remap(name, filament_names);
+        if (auto *parents = project_config->option<ConfigOptionStrings>("inherits_group")) {
+            // Штатный порядок группы: печать, все филаменты, принтер.
+            // Одноимённый библиотечный родитель не превращается в ссылку выбранной копии на себя.
+            const auto *print_id = project_config->option<ConfigOptionString>("print_settings_id");
+            const auto *filament_ids = project_config->option<ConfigOptionStrings>("filament_settings_id");
+            auto remap_parent = [&](std::string &parent, const auto &names, const std::string &selected) {
+                const std::string original = parent;
+                remap(parent, names);
+                if (parent == selected && parent != original)
+                    parent = original;
+            };
+            if (!parents->values.empty())
+                remap_parent(parents->values.front(), print_names, print_id ? print_id->value : std::string());
+            for (size_t i = 1; i + 1 < parents->values.size(); ++i)
+                remap_parent(parents->values[i], filament_names,
+                    filament_ids && i - 1 < filament_ids->values.size() ? filament_ids->values[i - 1] : std::string());
+        }
+    }
 
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(" enter, substitution_rule %1%, preset toltal count %2%")%substitution_rule% project_presets.size();
     try {
@@ -2819,14 +2869,20 @@ const int PresetBundle::get_required_hrc_by_filament_type(const std::string& fil
         return 0;
 }
 
-//BBS: add project embedded preset logic
+// Сохраняет выбранную часть изменений с явно заданными типом и `detach`.
+// Исключённые параметры восстанавливаются до сохранения; затем пересчитывается совместимость всех коллекций.
+// Непустой `source_name` защищает от сохранения другой записи при смене выбора после подтверждения диалога.
 void PresetBundle::save_changes_for_preset(const std::string& new_name, Preset::Type type,
-                                           const std::vector<std::string>& unselected_options, bool save_to_project)
+    const std::vector<std::string>& unselected_options, bool save_to_project, bool detach, const std::string &source_name)
 {
     PresetCollection& presets = type == Preset::TYPE_PRINT          ? prints :
                                 type == Preset::TYPE_SLA_PRINT      ? sla_prints :
                                 type == Preset::TYPE_FILAMENT       ? filaments :
                                 type == Preset::TYPE_SLA_MATERIAL   ? sla_materials : printers;
+
+    const std::string current_source = presets.get_edited_preset().name;
+    if (!source_name.empty() && current_source != source_name)
+        throw Slic3r::RuntimeError("Выбранный профиль изменился до сохранения: " + source_name);
 
     // if we want to save just some from selected options
     if (!unselected_options.empty()) {
@@ -2834,18 +2890,19 @@ void PresetBundle::save_changes_for_preset(const std::string& new_name, Preset::
         presets.get_edited_preset().config.apply_only(presets.get_selected_preset().config, unselected_options);
     }
 
-    // Save the preset into Slic3r::data_dir / presets / section_name / preset_name.ini
-    //BBS: add project embedded preset logic
-    //presets.save_current_preset(new_name);
-    presets.save_current_preset(new_name, false, save_to_project);
+    presets.save_current_preset(new_name, detach, save_to_project);
+    if (type == Preset::TYPE_FILAMENT) {
+        // Пакетное сохранение перепривязывает только ссылки на точный исходный ключ.
+        // Одноимённая запись другой области и остальные материалы не меняют свои слоты.
+        const std::string destination = filaments.get_selected_preset_name();
+        for (size_t i = 0; i < filament_presets.size(); ++i)
+            if (filament_presets[i] == current_source)
+                set_filament_preset(i, destination);
+    }
     // Mark the print & filament enabled if they are compatible with the currently selected preset.
     // If saving the preset changes compatibility with other presets, keep the now incompatible dependent presets selected, however with a "red flag" icon showing that they are no more compatible.
     update_compatible(PresetSelectCompatibleType::Never);
 
-    if (type == Preset::TYPE_FILAMENT) {
-        // synchronize the first filament presets.
-        set_filament_preset(0, filaments.get_selected_preset_name());
-    }
 }
 
 void PresetBundle::load_installed_filaments(AppConfig &config)
@@ -5125,6 +5182,8 @@ static void convert_filament_preset_name(std::string& machine_name, std::string&
 }
 // Load a config file from a boost property_tree. This is a private method called from load_config_file.
 // is_external == false on if called from ConfigWizard
+// Восстанавливает выбор и параметры профилей из полной конфигурации; неверные размеры массивов отклоняются.
+// Для опубликованного проекта применяет только разрешённые параметры, а полные материалы создаёт в проектной области.
 void PresetBundle::load_config_file_config(const std::string &name_or_path, bool is_external, DynamicPrintConfig &&config, Semver file_version, bool selected, PublishedConfig *published_config)
 {
     PrinterTechnology printer_technology = Preset::printer_technology(config);
@@ -6318,8 +6377,9 @@ void PresetBundle::load_config_file_config(const std::string &name_or_path, bool
                         const std::string old_name   = this->filament_presets[slot];
                         this->filament_presets[slot] = new_name;
                         material_applied             = true;
-                        published_config->material_replacements.emplace_back("slot " + std::to_string(slot) + ": " + old_name + " -> " +
-                                                                             new_name);
+                        // Уведомление показывает имя, а слот хранит полный ключ проектной записи.
+                        published_config->material_replacements.emplace_back("slot " + std::to_string(slot) + ": " + get_preset_bare_name(old_name) + " -> " +
+                                                                             get_preset_bare_name(new_name));
                         // Colour is slot-scoped and project-visible: sync into project_config
                         // (the copy already baked it, this makes the chips render).
                         if (entry.publish_color && !entry.color.empty()) {

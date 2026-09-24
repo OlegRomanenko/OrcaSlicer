@@ -1,3 +1,5 @@
+// Управляет жизненным циклом GUI, коллекциями профилей и переходами между проектами.
+// Сохранение несохранённых изменений передаёт выбранные параметры в `PresetBundle` до смены состояния приложения.
 #include "ExportPresetBundleDialog.hpp"
 #include "OrcaCloudServiceAgent.hpp"
 #include "libslic3r/Technologies.hpp"
@@ -8624,6 +8626,8 @@ std::vector<std::pair<unsigned int, std::string>> GUI_App::get_selected_presets(
 // This is called when:
 // - Exporting config_bundle
 // - Taking snapshot
+// Отмена запрещает вызывающему коду продолжить переход. При сохранении передаёт оба выбора диалога
+// и обновляет текущие профили и их выбор в настройках приложения.
 bool GUI_App::check_and_save_current_preset_changes(const wxString& caption, const wxString& header, bool remember_choice/* = true*/, bool dont_save_insted_of_discard/* = false*/)
 {
     if (has_current_preset_changes()) {
@@ -8640,8 +8644,14 @@ bool GUI_App::check_and_save_current_preset_changes(const wxString& caption, con
         if (dlg.save_preset())  // save selected changes
         {
             //BBS: add project embedded preset relate logic
-            for (const UnsavedChangesDialog::PresetData& nt : dlg.get_names_and_types())
-                preset_bundle->save_changes_for_preset(nt.name, nt.type, dlg.get_unselected_options(nt.type), nt.save_to_project);
+            try {
+                for (const UnsavedChangesDialog::PresetData& nt : dlg.get_names_and_types())
+                    preset_bundle->save_changes_for_preset(nt.name, nt.type, dlg.get_unselected_options(nt.type),
+                        nt.save_to_project, nt.detach, nt.source_name);
+            } catch (const std::runtime_error &error) {
+                GUI::show_error(mainframe, error.what());
+                return false;
+            }
             //for (const std::pair<std::string, Preset::Type>& nt : dlg.get_names_and_types())
             //    preset_bundle->save_changes_for_preset(nt.first, nt.second, dlg.get_unselected_options(nt.second));
 
@@ -8676,6 +8686,8 @@ void GUI_App::apply_keeped_preset_modifications()
 //                      => Current project isn't saved => UnsavedChangesDialog: "Keep / Discard / Save / Cancel"
 // Close ConfigWizard   => Current project is saved    => UnsavedChangesDialog: "Keep / Discard / Save / Cancel"
 // Note: no_nullptr postponed_apply_of_keeped_changes indicates that thie function is called after ConfigWizard is closed
+// Согласует сохранение, перенос или сброс перед сменой проекта; отмена возвращает `false`.
+// Тип сохранения и `detach` применяются только в ветке сохранения, перенос остаётся отдельным действием.
 bool GUI_App::check_and_keep_current_preset_changes(const wxString& caption, const wxString& header, int action_buttons, bool* postponed_apply_of_keeped_changes/* = nullptr*/)
 {
     if (has_current_preset_changes()) {
@@ -8705,8 +8717,14 @@ bool GUI_App::check_and_keep_current_preset_changes(const wxString& caption, con
             //BBS: add project embedded preset relate logic
             const auto& preset_names_and_types = dlg.get_names_and_types();
             if (dlg.save_preset()) {
-                for (const UnsavedChangesDialog::PresetData& nt : preset_names_and_types)
-                    preset_bundle->save_changes_for_preset(nt.name, nt.type, dlg.get_unselected_options(nt.type), nt.save_to_project);
+                try {
+                    for (const UnsavedChangesDialog::PresetData& nt : preset_names_and_types)
+                        preset_bundle->save_changes_for_preset(nt.name, nt.type, dlg.get_unselected_options(nt.type),
+                            nt.save_to_project, nt.detach, nt.source_name);
+                } catch (const std::runtime_error &error) {
+                    GUI::show_error(mainframe, error.what());
+                    return false;
+                }
 
                 // if we saved changes to the new presets, we should to
                 // synchronize config.ini with the current selections.

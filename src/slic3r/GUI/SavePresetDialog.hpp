@@ -1,6 +1,9 @@
 #ifndef slic3r_SavePresetDialog_hpp_
 #define slic3r_SavePresetDialog_hpp_
 
+// Собирает имя, область и наследование сохраняемых профилей. Для пластика и FFF-печати
+// возвращает канонический ключ назначения, а подтверждение перезаписи не удаляет прежнюю запись.
+
 //#include <wx/gdicmn.h>
 
 #include "libslic3r/Preset.hpp"
@@ -52,7 +55,7 @@ class SavePresetDialog : public DPIDialog
 
         bool            is_valid()      const { return m_valid_type != NoValid; }
         Preset::Type    type()          const { return m_type; }
-        std::string     preset_name()   const { return m_preset_name; }
+        std::string     preset_name()   const { return m_presets->saved_preset_name(m_preset_name, m_save_to_project); }
         //BBS: add project embedded preset relate logic
         bool save_to_project() const { return m_save_to_project; }
 
@@ -99,8 +102,8 @@ public:
 
     std::string get_name();
     std::string get_name(Preset::Type type);
-    void input_name_from_other(std::string new_preset_name);
-    void confirm_from_other();
+    void input_name_from_other(std::string new_preset_name, bool save_to_project = false);
+    bool confirm_from_other();
 
     bool enable_ok_btn() const;
     void add_info_for_edit_ph_printer(wxBoxSizer *sizer);
@@ -119,6 +122,7 @@ private:
     void build(std::vector<Preset::Type> types, std::string suffix = "");
     void on_select_cancel(wxCommandEvent &event);
     void update_physical_printers(const std::string &preset_name);
+    bool accept_items();
     void accept(wxCommandEvent &event);
 };
 

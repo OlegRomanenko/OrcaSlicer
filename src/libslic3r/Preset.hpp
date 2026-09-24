@@ -1,6 +1,10 @@
 #ifndef slic3r_Preset_hpp_
 #define slic3r_Preset_hpp_
 
+// Профили и владеющие ими коллекции: конфигурация, наследование, области имён и сохранение.
+// Для пластика и FFF-печати `name` служит каноническим ключом; отображаемое имя не определяет запись.
+// Проектная область живёт до закрытия проекта и не записывает файлы пользовательской библиотеки.
+
 #include <deque>
 #include <set>
 #include <string>
@@ -270,6 +274,8 @@ public:
     ConfigSubstitutions *loading_substitutions{nullptr};
     bool                is_user() const { return ! this->is_default && ! this->is_system && ! this->is_project_embedded && ! this->is_from_bundle(); }
     bool                can_overwrite() const { return ! this->is_default && ! this->is_system && ! this->is_from_bundle(); }
+    // Новые правила областей и диалогов относятся только к пластику и глобальной FFF-печати.
+    static bool         uses_project_namespace(Type type) { return type == TYPE_FILAMENT || type == TYPE_PRINT; }
     //bool                is_user() const { return ! this->is_default && ! this->is_system; }
 
     // Name of the preset, usually derived form the file name.
@@ -465,9 +471,9 @@ bool is_compatible_with_printer(const PresetWithVendorProfile &preset, const Pre
 bool is_compatible_with_printer(const DynamicPrintConfig &preset_config, Preset::Type preset_type,
                                 const DynamicPrintConfig &printer_config, const std::string &printer_name);
 
-// Where a preset is being loaded from. `Auto` lets load_presets() infer from the directory path.
+// Область канонического имени; `Auto` сохраняет явно заданную область или выводит её из пути загрузки.
 struct PresetOrigin {
-    enum class Kind { Auto, User, LocalBundle, SubscribedBundle };
+    enum class Kind { Auto, User, LocalBundle, SubscribedBundle, Project };
 
     Kind        kind { Kind::Auto };
     std::string bundle_id;
@@ -478,7 +484,7 @@ struct PresetOrigin {
     bool is_bundle() const { return kind == Kind::LocalBundle || kind == Kind::SubscribedBundle; }
 };
 
-// Prepend the bundle folder to `preset_bare_name` based on `origin`. No-op for non-bundle origins.
+// Формирует ключ из обычного имени и области. Пользовательские имена остаются неквалифицированными.
 std::string get_preset_canonical_name(const std::string &preset_bare_name, const PresetOrigin &origin);
 
 // Tail segment of a canonical name — what's written to the bundle's .json filename and JSON "name" field.
@@ -631,25 +637,21 @@ public:
         const Semver                file_version = Semver(),
         const std::string           filament_id = std::string());
 
-    // Save the preset under a new name. If the name is different from the old one,
-    // a new preset is stored into the list of presets.
-    // All presets are marked as not modified and the new preset is activated.
-    //BBS: add project embedded preset logic
+    // Сохраняет и выбирает запись назначения; для пластика и FFF-печати ключ включает область.
+    // Копирование между областями не меняет исходную запись. Подтверждение перезаписи другой
+    // записи получает вызывающий код; неизвестный родитель или цикл приводят к исключению до записи.
     void            save_current_preset(const std::string &new_name, bool detach = false, bool save_to_project = false, Preset* _curr_preset = nullptr);
-    // Insert a standalone user preset holding the full resolved config (no inheritance,
-    // no vendor links): the libslic3r equivalent of "Detach from parent". Takes a
-    // resolved config, clears parent/vendor/alias metadata, stamps filament_settings_id.
-    // Unlike save_current_preset it does not force-select or diff against a parent.
-    // Used by the published-3MF Full Publish path. The optional filament_id seeds the
-    // preset's stable material grouping (get_filament_presets groups user bases by
-    // filament_id); the published entry's filament_id is forwarded so the copy keeps
-    // the author's grouping.
-    // The copy is a project-embedded preset ("Preset Inside Project"): it lives inside
-    // the loaded project only, is serialized into the saved .3mf via
-    // get_current_project_embedded_presets(), and is never written to the user's
-    // library directory.
-    // Returns the final (uniquified) name; on collision the suffix rule is:
-    // "<base>" -> "<base> (Published)" -> "<base> (Published 2)" ...
+    // Полный ключ назначения для диалога и сохранения; принимает обычное либо уже каноническое имя.
+    // Для принтеров и SLA сохраняется прежняя адресация без отдельного проектного пространства.
+    std::string     saved_preset_name(const std::string &name, bool save_to_project) const;
+    // Перезапись другой записи в области назначения требует подтверждения; сохранение в себя — нет.
+    bool            save_requires_confirmation(const std::string &name, bool save_to_project) const;
+    // Создаёт самостоятельный проектный профиль из полной конфигурации для `Full Publish` в `.3mf`.
+    // Удаляет наследование, поставщика и псевдоним, задаёт собственный `filament_settings_id`,
+    // но не меняет текущий выбор. `filament_id` сохраняет авторскую группировку материалов.
+    // Запись живёт только в проекте, экспортируется через `get_current_project_embedded_presets()`
+    // и не сохраняется в пользовательскую библиотеку. Возвращает канонический ключ; коллизии
+    // внутри проектной области разрешаются суффиксами `(Published)`, `(Published 2)` и далее.
     std::string     add_detached_preset(const std::string &name_base, DynamicPrintConfig config,
                                         const std::string &filament_id = std::string());
 

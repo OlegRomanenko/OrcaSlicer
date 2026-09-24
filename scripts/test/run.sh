@@ -7,12 +7,16 @@ set -euo pipefail
 # сборки без компиляции приложения; оба набора не принимают аргументы Catch2.
 # Для version флаг --appimage дополнительно запускает готовый AppImage с --help,
 # без GUI и с изолированными пользовательскими каталогами внутри контейнера.
+# Набор gui передаёт управление gui.sh: проверяет главное окно готового AppImage
+# на отдельном Xvfb-дисплее локально либо на явно указанном SSH-хосте, без контейнера.
 #
-# Нужны Bash, Docker/Podman, GNU-утилиты; кроме version, нужна Release-сборка в build/.
+# Для контейнерных наборов нужны Bash, Docker/Podman и GNU-утилиты;
+# кроме version, нужна Release-сборка в build/. Зависимости gui проверяет gui.sh.
 # ORCA_CONTAINER_CLI и ORCA_DOCKER_* выбирают образ как в build_linux.sh;
 # CMAKE_BUILD_PARALLEL_LEVEL задаёт число задач сборки, ORCA_TEST_TIMEOUT — секунды теста.
 # Скрипт пишет результаты сборки/тестов в проект и полные логи в новый временный каталог.
-# Образы не загружаются, сеть отключена, контейнеры удаляются, логи сохраняются.
+# В контейнерных наборах образы не загружаются, сеть отключена, контейнеры удаляются;
+# логи сохраняются для всех наборов.
 # Ошибки сборки, тестов, тайм-аута и логирования возвращаются вызывающему процессу.
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
@@ -20,6 +24,7 @@ suite=${1:-fff_print}
 if (($#)); then shift; fi
 suites=(fff_print libslic3r libnest2d slic3rutils sla_print filament_group)
 case "$suite" in
+    gui) exec bash "$repo_root/scripts/test/gui.sh" "$@" ;;
     fff_print|libslic3r|libnest2d|slic3rutils|sla_print|filament_group) targets=("${suite}_tests") ;;
     version)
         check_appimage=OFF

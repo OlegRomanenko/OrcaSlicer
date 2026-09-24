@@ -1,3 +1,6 @@
+// Читает и записывает проекты `.3mf` формата Bambu/Orca: модель, конфигурацию, пластины и вложенные профили.
+// Архивные записи распаковываются через временный каталог модели; профили передаются вызывающему коду во владение.
+// Самостоятельный вложенный материал хранит свой `filament_id`, поскольку системного родителя у него нет.
 #include "../libslic3r.h"
 #include "../Exception.hpp"
 #include "../Model.hpp"
@@ -2703,6 +2706,9 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
     }
 
     //BBS: extract project embedded presets
+    // Распаковывает один профиль, читает конфигурацию и метаданные, затем передаёт новый `Preset` в `project_presets`.
+    // При ошибке извлечения или отсутствии идентификатора профиля запись пропускается; разрешение наследования
+    // выполняет коллекция позднее. Временный путь не является местом сохранения пользовательского профиля.
     void _BBS_3MF_Importer::_extract_project_embedded_presets_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, std::vector<Preset*>&project_presets, Model& model, Preset::Type type, bool use_json)
     {
         if (stat.m_uncomp_size > 0) {
@@ -2774,6 +2780,13 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             preset->is_project_embedded = true;
             preset->is_external = true;
             preset->is_dirty = false;
+
+            // `load_from_json` возвращает `filament_id` как метаданные, а не как параметр конфигурации.
+            if (type == Preset::TYPE_FILAMENT) {
+                const auto filament_id = key_values.find(BBL_JSON_KEY_FILAMENT_ID);
+                if (filament_id != key_values.end())
+                    preset->filament_id = filament_id->second;
+            }
 
             std::string version_str = key_values[BBL_JSON_KEY_VERSION];
             boost::optional<Semver> version = Semver::parse(version_str);

@@ -1,3 +1,6 @@
+// Хранит профили и их наследование, загружает пользовательские и вложенные конфигурации.
+// Коллекции владеют профилями; сохранение может писать JSON и метаданные, но проектные профили экспортируются отдельно.
+// Пустой `inherits` означает самостоятельную конфигурацию, а не отсутствующего внешнего родителя.
 #include <cassert>
 
 #include "Config.hpp"
@@ -65,10 +68,16 @@ struct ParsedName {
     std::string        bare;
 };
 
-// Canonical names are built in-memory with '/' separators, so a straight prefix+split match is enough.
+// Разбирает только известные служебные префиксы; обычные имена не меняются.
+// Проектная область одна на открытую модель и, в отличие от пакета, не требует `bundle_id`.
 static ParsedName parse_preset_name(const std::string &raw_name)
 {
     ParsedName out;
+    if (boost::starts_with(raw_name, "_project/")) {
+        out.kind = PresetOrigin::Kind::Project;
+        out.bare = raw_name.substr(std::string("_project/").size());
+        return out;
+    }
 
     auto try_prefix = [&](const char *dir, PresetOrigin::Kind kind) {
         const std::string prefix = std::string(dir) + "/";
@@ -93,9 +102,12 @@ static ParsedName parse_preset_name(const std::string &raw_name)
 
 } // namespace
 
+// Служебный ключ отделяет проектные записи и пакеты от пользовательских имён.
 std::string get_preset_canonical_name(const std::string &preset_bare_name, const PresetOrigin &origin)
 {
     switch (origin.kind) {
+    case PresetOrigin::Kind::Project:
+        return "_project/" + preset_bare_name;
     case PresetOrigin::Kind::LocalBundle:
         return origin.bundle_id.empty() ? preset_bare_name : std::string(PRESET_LOCAL_DIR) + "/" + origin.bundle_id + "/" + preset_bare_name;
     case PresetOrigin::Kind::SubscribedBundle:
@@ -780,10 +792,14 @@ void Preset::reload(Preset const &parent)
 }
 
 // Return a label of this preset, consisting of a name and a "(modified)" suffix, if this preset is dirty.
+// Возвращает подпись с признаком изменения. `no_alias` сохраняет полный ключ для существующих
+// внутренних потребителей; обычная подпись проектного профиля не раскрывает служебный префикс.
 std::string Preset::label(bool no_alias) const
 {
+    const std::string display_name = !no_alias && is_project_embedded && uses_project_namespace(type) ?
+        get_preset_bare_name(name) : name;
     return (this->is_dirty ? g_suffix_modified : "")
-        + ((no_alias || this->alias.empty()) ? this->name : this->alias);
+        + ((no_alias || this->alias.empty() || (is_project_embedded && uses_project_namespace(type))) ? display_name : this->alias);
 }
 
 bool is_compatible_with_print(const PresetWithVendorProfile &preset, const PresetWithVendorProfile &active_print, const PresetWithVendorProfile &active_printer)
@@ -1873,23 +1889,30 @@ void PresetCollection::load_presets(
         throw Slic3r::RuntimeError(errors_cummulative);
 }
 
-//BBS: add function to generate differed preset for save
-//the pointer should be freed by the caller
+// Возвращает отличия от родителя либо полную конфигурацию самостоятельного проектного профиля.
+// Результатом владеет вызывающий код. Защищённый профиль или неразрешимый родитель дают `nullptr`.
 Preset* PresetCollection::get_preset_differed_for_save(Preset& preset)
 {
     if (preset.is_system || preset.is_default)
         return nullptr;
 
-    Preset* new_preset = nullptr;
+    std::unique_ptr<Preset> new_preset;
     //BBS: only save difference for user preset
     std::string& inherits = preset.inherits();
     Preset* parent_preset = nullptr;
     if (!inherits.empty()) {
         parent_preset = this->find_preset(inherits, false, true);
     }
+    // Без родителя нет базы для вычисления отличий; вложенный профиль обязан нести все значения.
+    if (inherits.empty() && preset.is_project_embedded) {
+        new_preset = std::make_unique<Preset>(preset);
+        // В архиве сохраняется `config`, поэтому идентификатор материала переносится в существующее JSON-поле.
+        if (!preset.filament_id.empty())
+            new_preset->config.set_key_value(BBL_JSON_KEY_FILAMENT_ID, new ConfigOptionString(preset.filament_id));
+        return new_preset.release();
+    }
     if (parent_preset) {
-        new_preset = new Preset();
-        *new_preset = preset;
+        new_preset = std::make_unique<Preset>(preset);
 
         DynamicPrintConfig temp_config;
         std::vector<std::string> dirty_options = preset.config.diff(parent_preset->config);
@@ -1931,7 +1954,7 @@ Preset* PresetCollection::get_preset_differed_for_save(Preset& preset)
         new_preset->config = temp_config;
     }
 
-    return new_preset;
+    return new_preset.release();
 }
 
 //BBS:get the differencen values to update
@@ -2004,87 +2027,123 @@ int PresetCollection::get_differed_values_to_update(Preset& preset, std::map<std
     return 0;
 }
 
-//BBS: save user presets to local
+// Загружает вложенные профили нужного типа, сохраняя их проектный статус и не записывая пользовательские файлы.
+// Независимые профили дополняются значениями по умолчанию; отличия требуют найденного родителя.
+// Существующие проектные ключи, циклы и профили без требуемого родителя пропускаются с диагностикой.
+// Родители разрешаются независимо от порядка архива; ошибки формата агрегируются в исключение.
 void PresetCollection::load_project_embedded_presets(std::vector<Preset*>& project_presets, const std::string& type, PresetsConfigSubstitutions& substitutions, ForwardCompatibilitySubstitutionRule rule)
 {
     std::string errors_cummulative;
-    // Store the loaded presets into a new vector, otherwise the binary search for already existing presets would be broken.
-    // (see the "Preset already present, not loading" message).
     std::deque<Preset> presets_loaded;
-    std::vector<Preset*>::iterator it;
+    std::vector<Preset*> pending;
+    std::map<std::string, std::string> legacy_names;
+    std::set<std::string> incoming_names;
+    std::unique_lock<std::recursive_mutex> guard(m_mutex);
+    const std::string selected_name = get_selected_preset().name;
 
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(" enter, type %1% , total preset counts %2%")%Preset::get_type_string(m_type) %project_presets.size();
     std::string extruder_id_name, extruder_variant_name;
     std::set<std::string> *key_set1 = nullptr, *key_set2 = nullptr;
     Preset::get_extruder_names_and_keysets(m_type, extruder_id_name, extruder_variant_name, &key_set1, &key_set2);
 
-    lock();
-    for (it = project_presets.begin(); it != project_presets.end(); it++) {
-        Preset* preset = *it;
+    for (Preset *preset : project_presets) {
         if (preset->type != Preset::get_type_from_string(type)) continue;
         if (!preset->is_project_embedded) continue;
-        std::string name = preset->name;
-        if (this->find_preset(name, false)) {
-            BOOST_LOG_TRIVIAL(warning) << "Preset already present, not loading: " << name;
+        const std::string original_name = preset->name;
+        preset->name = saved_preset_name(original_name, true);
+        if (preset->name != original_name)
+            legacy_names.emplace(original_name, preset->name);
+        if (this->find_preset(preset->name, false) || !incoming_names.insert(preset->name).second) {
+            BOOST_LOG_TRIVIAL(warning) << "Preset already present, not loading: " << preset->name;
             continue;
         }
-        try {
-            DynamicPrintConfig config = preset->config;
-            if (preset->loading_substitutions && ! preset->loading_substitutions->empty()) {
-                substitutions.push_back({ preset->name, m_type, PresetConfigSubstitutions::Source::ProjectFile, preset->name, std::move(*(preset->loading_substitutions))});
-                free(preset->loading_substitutions);
-                preset->loading_substitutions = NULL;
+        pending.push_back(preset);
+    }
+    // Старые ссылки между вложенными записями переводятся вместе с именами. Одноимённый
+    // постоянный родитель самой копии не превращается в ссылку этой копии на себя.
+    for (Preset *preset : pending) {
+        auto parent = legacy_names.find(preset->inherits());
+        if (parent != legacy_names.end() && parent->second != preset->name)
+            preset->inherits() = parent->second;
+    }
+    // Архив не обязан хранить родителей раньше детей. Готовые конфигурации доступны
+    // следующему проходу, а отсутствие продвижения завершает цикл без рекурсии.
+    while (!pending.empty()) {
+        bool progressed = false;
+        for (auto it = pending.begin(); it != pending.end();) {
+            Preset *preset = *it;
+            const std::string parent_name = preset->inherits();
+            Preset *inherit_preset = parent_name.empty() ? nullptr :
+                parse_preset_name(parent_name).kind == PresetOrigin::Kind::Project ?
+                    this->find_preset(parent_name, false, true) : this->find_preset2(parent_name, true);
+            if (!inherit_preset) {
+                auto loaded = std::find_if(presets_loaded.begin(), presets_loaded.end(), [&](const Preset &candidate) {
+                    return candidate.name == parent_name;
+                });
+                if (loaded != presets_loaded.end())
+                    inherit_preset = &*loaded;
             }
-            //BBS: use inherit config as the base
-            Preset* inherit_preset = nullptr;
-            ConfigOption* inherits_config = config.option(BBL_JSON_KEY_INHERITS);
-            if (inherits_config) {
-                ConfigOptionString * option_str = dynamic_cast<ConfigOptionString *> (inherits_config);
-                std::string inherits_value = option_str->value;
-                /*size_t pos = inherits_value.find_first_of('*');
-                if (pos != std::string::npos) {
-                    inherits_value.replace(pos, 1, 1, '~');
-                    option_str->value = inherits_value;
-                }*/
-                inherit_preset = this->find_preset2(inherits_value, true);
-                Preset::normalize_inherits(config, inherit_preset);
-            }
-            const Preset& default_preset = this->default_preset_for(config);
-            if (inherit_preset) {
-                preset->config = inherit_preset->config;
-                preset->filament_id = inherit_preset->filament_id;
-            }
-            else {
-                // Find a default preset for the config. The PrintPresetCollection provides different default preset based on the "printer_technology" field.
-                //BBS 202407: don't load project embedded preset when can not find inherit
-                //preset->config = default_preset.config;
-                BOOST_LOG_TRIVIAL(error) << boost::format("can not find parent for config %1%!")%preset->file;
+            if (!inherit_preset && !parent_name.empty() && incoming_names.count(parent_name)) {
+                ++it;
                 continue;
             }
-            preset->config.update_diff_values_to_child_config(config, extruder_id_name, extruder_variant_name, *key_set1, *key_set2);
-            //preset->config.apply(std::move(config));
-            Preset::normalize(preset->config);
-            // Report configuration fields, which are misplaced into a wrong group.
-            std::string incorrect_keys = Preset::remove_invalid_keys(preset->config, default_preset.config);
-            if (!incorrect_keys.empty()) {
-                ++m_errors;
-                BOOST_LOG_TRIVIAL(error) << "Error in a preset file: The preset \"" << preset->name
-                                         << "\" contains the following incorrect keys: " << incorrect_keys << ", which were removed";
+            it = pending.erase(it);
+            progressed = true;
+            try {
+                DynamicPrintConfig config = preset->config;
+                if (preset->loading_substitutions && !preset->loading_substitutions->empty()) {
+                    substitutions.push_back({preset->name, m_type, PresetConfigSubstitutions::Source::ProjectFile,
+                        preset->name, std::move(*preset->loading_substitutions)});
+                    free(preset->loading_substitutions);
+                    preset->loading_substitutions = nullptr;
+                }
+                Preset::normalize_inherits(config, inherit_preset);
+                const Preset &default_preset = this->default_preset_for(config);
+                if (inherit_preset) {
+                    preset->config = inherit_preset->config;
+                    preset->filament_id = inherit_preset->filament_id;
+                } else if (Preset::inherits(config).empty()) {
+                    // Самостоятельная запись содержит полную конфигурацию, новые поля берутся из штатных значений.
+                    preset->config = default_preset.config;
+                } else {
+                    // Непустой неизвестный родитель нельзя заменить значениями по умолчанию: сохранены лишь отличия.
+                    BOOST_LOG_TRIVIAL(error) << "Cannot find project preset parent: " << preset->name << " -> " << parent_name;
+                    continue;
+                }
+                preset->config.update_diff_values_to_child_config(config, extruder_id_name, extruder_variant_name, *key_set1, *key_set2);
+                Preset::normalize(preset->config);
+                const std::string incorrect_keys = Preset::remove_invalid_keys(preset->config, default_preset.config);
+                if (!incorrect_keys.empty()) {
+                    ++m_errors;
+                    BOOST_LOG_TRIVIAL(error) << "Error in a preset file: The preset \"" << preset->name
+                        << "\" contains the following incorrect keys: " << incorrect_keys << ", which were removed";
+                }
+                if (m_type == Preset::TYPE_PRINT)
+                    preset->config.option<ConfigOptionString>("print_settings_id", true)->value = preset->name;
+                else if (m_type == Preset::TYPE_FILAMENT)
+                    preset->config.option<ConfigOptionStrings>("filament_settings_id", true)->values = {preset->name};
+                preset->loaded = true;
+                presets_loaded.emplace_back(*preset);
+                BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ", loaded project preset " << preset->name;
+            } catch (const std::runtime_error &err) {
+                errors_cummulative += err.what();
+                errors_cummulative += "\n";
             }
-            preset->loaded = true;
-            presets_loaded.emplace_back(*preset);
-            BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(", %1% got preset, name %2%, path %3%, is_system %4%, is_default %5% is_visible %6%")%Preset::get_type_string(m_type) %preset->name %preset->file %preset->is_system %preset->is_default %preset->is_visible;
-        } catch (const std::runtime_error &err) {
-            errors_cummulative += err.what();
-            errors_cummulative += "\n";
+        }
+        if (!progressed) {
+            for (const Preset *preset : pending)
+                BOOST_LOG_TRIVIAL(error) << "Unresolved or cyclic project parent: " << preset->name << " -> " << preset->inherits();
+            break;
         }
     }
 
     m_presets.insert(m_presets.end(), std::make_move_iterator(presets_loaded.begin()), std::make_move_iterator(presets_loaded.end()));
     sort_presets();
-    //don't select it here
-    //this->select_preset(first_visible_idx());
-    unlock();
+    // Сортировка не должна незаметно менять выбранную библиотечную запись или её отредактированную копию.
+    auto selected = find_preset_internal(selected_name);
+    if (selected != m_presets.end() && selected->name == selected_name)
+        m_idx_selected = static_cast<size_t>(selected - m_presets.begin());
+    guard.unlock();
 
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(" finished, %1% got %2% presets, errors_cummulative %3%")%Preset::get_type_string(m_type) %presets_loaded.size() %errors_cummulative;
     if (! errors_cummulative.empty())
@@ -2579,6 +2638,9 @@ static bool profile_print_params_same(const DynamicPrintConfig &cfg_old, const D
 // and select it, losing previous modifications.
 // Only a single profile could be edited at at the same time, which introduces complexity when loading
 // filament profiles for multi-extruder printers.
+// Проектный канонический ключ обозначает конкретную запись даже при совпадении параметров с родителем.
+// Возвращённым профилем владеет коллекция; выбор и отредактированная копия зависят от `select`.
+// Для `.3mf` новые записи остаются проектными и не записывают пользовательский JSON.
 std::pair<Preset*, bool> PresetCollection::load_external_preset(
     // Path to the profile source file (a G-code, an AMF or 3MF file, a config file)
     const std::string           &path,
@@ -2595,6 +2657,9 @@ std::pair<Preset*, bool> PresetCollection::load_external_preset(
     const Semver                file_version,
     const std::string           filament_id)
 {
+    const bool project_reference = Preset::uses_project_namespace(m_type) &&
+        parse_preset_name(original_name).kind == PresetOrigin::Kind::Project;
+    const bool from_project = boost::algorithm::iends_with(name, ".3mf") || project_reference;
     // Load the preset over a default preset, so that the missing fields are filled in from the default preset.
     DynamicPrintConfig cfg(this->default_preset_for(combined_config).config);
     // SoftFever: ignore print connection info from project
@@ -2611,7 +2676,7 @@ std::pair<Preset*, bool> PresetCollection::load_external_preset(
     //add different settings check logic, replace the old system preset's default value with new system preset's default values
     std::deque<Preset>::iterator it       = this->find_preset_internal(original_name);
     bool                         found    = it != m_presets.end() && it->name == original_name;
-    if (! found) {
+    if (!found && !project_reference) {
         // Try to match the original_name against the "renamed_from" profile names of loaded system profiles.
         it = this->find_preset_renamed(original_name);
         found = it != m_presets.end();
@@ -2642,7 +2707,7 @@ std::pair<Preset*, bool> PresetCollection::load_external_preset(
         // Some filament profile has been selected and modified already.
         // Check whether this profile is equal to the modified edited profile.
         const Preset &edited = this->get_edited_preset();
-        if ((edited.name == original_name || edited.name == inherits) && profile_print_params_same(edited.config, cfg)) {
+        if ((edited.name == original_name || (!project_reference && edited.name == inherits)) && profile_print_params_same(edited.config, cfg)) {
             // Just point to that already selected and edited profile.
             //BBS: add config related logs
             BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(" Just point to that already selected and edited profile %1%")%edited.name;
@@ -2672,7 +2737,7 @@ std::pair<Preset*, bool> PresetCollection::load_external_preset(
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(" The preset exists and it matches the values stored inside config. using original_name %1%")%original_name;
         return std::make_pair(&(*it), false);
     }
-    if (! found && select != LoadAndSelect::Never && ! inherits.empty()) {
+    if (!found && !project_reference && select != LoadAndSelect::Never && !inherits.empty()) {
         // Try to use a system profile as a base to select the system profile
         // and override its settings with the loaded ones.
         assert(it == m_presets.end());
@@ -2768,7 +2833,9 @@ std::pair<Preset*, bool> PresetCollection::load_external_preset(
                 prefix = reduced_name + "-" + std::to_string(idx) ;
         }
         //new_name = name + suffix;
-        new_name = prefix + "(" + name + ")";
+        new_name = project_reference && idx == 0 ? original_name : prefix + "(" + name + ")";
+        if (from_project)
+            new_name = saved_preset_name(new_name, true);
         it = this->find_preset_internal(new_name);
         if (it == m_presets.end() || it->name != new_name)
             // Unique profile name. Insert a new profile.
@@ -2785,7 +2852,6 @@ std::pair<Preset*, bool> PresetCollection::load_external_preset(
     }
     // Insert a new profile.
     //BBS: add project embedded preset logic
-    bool from_project = boost::algorithm::iends_with(name, ".3mf");
     if (m_type == Preset::TYPE_PRINT)
         cfg.option<ConfigOptionString >("print_settings_id", true)->value  = new_name;
     else if (m_type == Preset::TYPE_FILAMENT)
@@ -2818,8 +2884,10 @@ std::pair<Preset*, bool> PresetCollection::load_external_preset(
         //we can not reach here
         preset.save(nullptr);
     }
-    if (&this->get_selected_preset() == &preset)
+    if (&this->get_selected_preset() == &preset) {
         this->get_edited_preset().is_external = true;
+        this->get_edited_preset().is_project_embedded = preset.is_project_embedded;
+    }
 
     //BBS: add config related logs
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(", type %1% added a preset, name %2%, path %3%, is_system %4%, is_default %5% is_external %6%")%Preset::get_type_string(m_type) %preset.name %preset.file %preset.is_system %preset.is_default %preset.is_external;
@@ -2963,106 +3031,145 @@ std::map<std::string, std::vector<Preset const *>> PresetCollection::get_filamen
     return filament_presets;
 }
 
-//BBS: add project embedded preset logic
+// Возвращает ключ назначения без изменения коллекции; явный выбор области важнее области входного ключа.
+std::string PresetCollection::saved_preset_name(const std::string &name, bool save_to_project) const
+{
+    return canonical_preset_name(name, Preset::uses_project_namespace(m_type) ?
+        PresetOrigin(save_to_project ? PresetOrigin::Kind::Project : PresetOrigin::Kind::User) : PresetOrigin());
+}
+
+// Сравнивает записи по полному ключу, а не по видимому имени. Защищённая запись не является допустимой перезаписью.
+bool PresetCollection::save_requires_confirmation(const std::string &name, bool save_to_project) const
+{
+    const std::string target_name = saved_preset_name(name, save_to_project);
+    const Preset *target = find_preset(target_name, false);
+    return target && target->can_overwrite() && target_name != get_selected_preset().name;
+}
+
+// Создаёт или перезаписывает профиль из отредактированной конфигурации и делает его выбранным.
+// Копирование между областями сохраняет исходную запись; облачная идентичность принадлежит назначению.
+// `detach` сохраняет разрешённые значения, очищая связь с родителем. Защищённая запись остаётся неизменной.
+// Коллекция блокируется на время изменения; RAII освобождает блокировку при выходе, запись выполняется после неё.
 void PresetCollection::save_current_preset(const std::string &new_name, bool detach, bool save_to_project, Preset* _curr_preset)
 {
     Preset curr_preset = _curr_preset ? *_curr_preset : m_edited_preset;
-    //BBS: add lock logic for sync preset in background
-    std::string final_inherits;
-    lock();
-    // 1) Find the preset with a new_name or create a new one,
-    // initialize it with the edited config.
-    auto it = this->find_preset_internal(new_name);
-    const bool preset_existed = (it != m_presets.end() && it->name == new_name);
-    if (it != m_presets.end() && it->name == new_name) {
-        // Preset with the same name found.
-        Preset &preset = *it;
-        //BBS: add project embedded preset logic
-        if (!preset.can_overwrite()) {
-        //if (preset.is_default || preset.is_external || preset.is_system)
-            // Cannot overwrite the default preset.
-            //BBS: add lock logic for sync preset in background
-            unlock();
+    std::unique_lock<std::recursive_mutex> guard(m_mutex);
+    const bool scoped = Preset::uses_project_namespace(m_type);
+    const std::string target_name = saved_preset_name(new_name, save_to_project);
+    const std::string source_name = curr_preset.name;
+    // Системное имя остаётся зарезервированным и при выборе проектного назначения.
+    if (scoped) {
+        const Preset *reserved = find_preset(get_preset_bare_name(target_name), false);
+        if (reserved && !reserved->can_overwrite())
             return;
-        }
-        // Overwriting an existing preset.
-        preset.config = std::move(curr_preset.config);
-        // The newly saved preset will be activated -> make it visible.
-        preset.is_visible = true;
-        //TODO: remove the detach logic
-        if (detach) {
-            // Clear the link to the parent profile.
-            preset.vendor = nullptr;
-			preset.inherits().clear();
-			preset.alias.clear();
-			preset.renamed_from.clear();
-            preset.m_excluded_from.clear();
-            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": save preset %1% , with detach")%new_name;
-        }
-        //BBS: add lock logic for sync preset in background
-
-        if (m_type == Preset::TYPE_PRINT)
-            preset.config.option<ConfigOptionString>("print_settings_id", true)->value = new_name;
-        else if (m_type == Preset::TYPE_FILAMENT)
-            preset.config.option<ConfigOptionStrings>("filament_settings_id", true)->values[0] = new_name;
-        else if (m_type == Preset::TYPE_PRINTER)
-            preset.config.option<ConfigOptionString>("printer_settings_id", true)->value = new_name;
-        final_inherits = preset.inherits();
-        unlock();
-        // TODO: apply change from custom root to devided presets.
-        if (preset.inherits().empty()) {
-            for (auto &preset2 : m_presets)
-                if (preset2.inherits() == preset.name)
-                    preset2.reload(preset);
-        }
-    } else {
-        // Creating a new preset.
-        Preset       &preset   = *m_presets.insert(it, curr_preset);
-        std::string  &inherits = preset.inherits();
-        std::string   old_name = preset.name;
-        preset.name = new_name;
-        preset.vendor = nullptr;
-		preset.alias.clear();
-        preset.renamed_from.clear();
-        preset.m_excluded_from.clear();
-        preset.setting_id.clear();
-        if (detach) {
-        	// Clear the link to the parent profile.
-        	inherits.clear();
-            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": save preset %1% , with detach")%new_name;
-        } else if (is_base_preset(preset)) {
-            inherits = old_name;
-        }
-
-        preset.is_default  = false;
-        preset.is_system   = false;
-        preset.is_external = false;
-
-        preset.bundle_id.clear();
-
-        preset.file        = this->path_for_preset(preset);
-        // The newly saved preset will be activated -> make it visible.
-        preset.is_visible  = true;
-        // Just system presets have aliases
-        preset.alias.clear();
-        //BBS: add project embedded preset logic
-        if (save_to_project) {
-            preset.is_project_embedded = true;
-        }
-        else
-            preset.is_project_embedded = false;
-        if (m_type == Preset::TYPE_PRINT)
-            preset.config.option<ConfigOptionString>("print_settings_id", true)->value = new_name;
-        else if (m_type == Preset::TYPE_FILAMENT)
-            preset.config.option<ConfigOptionStrings>("filament_settings_id", true)->values[0] = new_name;
-        else if (m_type == Preset::TYPE_PRINTER)
-            preset.config.option<ConfigOptionString>("printer_settings_id", true)->value = new_name;
-        //BBS: add lock logic for sync preset in background
-        final_inherits = inherits;
-        unlock();
     }
+    auto it = this->find_preset_internal(target_name);
+    const bool preset_existed = (it != m_presets.end() && it->name == target_name);
+    if (preset_existed && !it->can_overwrite())
+        return;
+
+    // Подготавливаем копию до изменения коллекции: ошибка наследования не должна портить назначение.
+    Preset saved = preset_existed ? *it : curr_preset;
+    saved.config = curr_preset.config;
+    if (!detach && is_base_preset(curr_preset) && (!preset_existed || (scoped && source_name != target_name)))
+        saved.inherits() = source_name;
+    if (detach) {
+        saved.inherits().clear();
+    } else if (scoped) {
+        // Выбираем ближайшего родителя, чья цепочка не зависит от временной области или назначения.
+        // Проверяется вся цепочка: постоянная запись над проектным предком тоже не подходит библиотечной копии.
+        std::set<std::string> visited;
+        std::string parent_name = saved.inherits();
+        const Preset *saved_parent = nullptr;
+        bool choose_parent = true;
+        while (!parent_name.empty()) {
+            const Preset *parent = find_preset2(parent_name, true);
+            if (!parent)
+                throw Slic3r::RuntimeError("Не найден родитель сохраняемого профиля: " + parent_name);
+            if (!visited.insert(parent->name).second)
+                throw Slic3r::RuntimeError("Циклическое наследование профиля: " + parent->name);
+            if (parent->name == target_name || (!save_to_project && parent->is_project_embedded)) {
+                saved_parent = nullptr;
+                choose_parent = true;
+            } else if (choose_parent) {
+                saved_parent = parent;
+                choose_parent = false;
+            }
+            parent_name = parent->inherits();
+        }
+        saved.inherits() = saved_parent ? saved_parent->name : std::string();
+    }
+    saved.name = target_name;
+    if (detach || !preset_existed) {
+        saved.vendor = nullptr;
+        saved.alias.clear();
+        saved.renamed_from.clear();
+        saved.m_excluded_from.clear();
+    }
+    if (detach || saved.inherits().empty() || saved.inherits() != curr_preset.inherits() ||
+        (preset_existed && saved.inherits() != it->inherits()))
+        saved.base_id.clear();
+    if (!preset_existed) {
+        saved.is_default = false;
+        saved.is_system = false;
+        saved.is_external = false;
+        saved.bundle_id.clear();
+        saved.setting_id.clear();
+        saved.user_id.clear();
+        saved.updated_time = 0;
+        saved.sync_info = save_to_project ? "" : "create";
+    }
+    if (!preset_existed || scoped)
+        saved.is_project_embedded = save_to_project;
+    if (!preset_existed)
+        saved.file = save_to_project && scoped ? std::string() : this->path_for_preset(saved);
+    saved.is_visible = true;
+
+    if (m_type == Preset::TYPE_PRINT)
+        saved.config.option<ConfigOptionString>("print_settings_id", true)->value = target_name;
+    else if (m_type == Preset::TYPE_FILAMENT)
+        saved.config.option<ConfigOptionStrings>("filament_settings_id", true)->values = {target_name};
+    else if (m_type == Preset::TYPE_PRINTER)
+        saved.config.option<ConfigOptionString>("printer_settings_id", true)->value = target_name;
+    // У проектного ребёнка нет пользовательского JSON для `reload`. Сохраняем его собственные отличия
+    // относительно прежнего родителя до перезаписи, чтобы обычное сохранение родителя обновило наследование.
+    std::map<std::string, DynamicPrintConfig> project_child_overrides;
+    if (scoped && preset_existed && saved.inherits().empty()) {
+        for (const Preset &child : m_presets) {
+            if (child.is_project_embedded && child.inherits() == target_name &&
+                (source_name == target_name || child.name != source_name)) {
+                DynamicPrintConfig overrides;
+                overrides.apply_only(child.config, child.config.diff(it->config));
+                project_child_overrides.emplace(child.name, std::move(overrides));
+            }
+        }
+    }
+    if (preset_existed)
+        *it = std::move(saved);
+    else {
+        if (m_idx_selected != size_t(-1) && static_cast<size_t>(it - m_presets.begin()) <= m_idx_selected)
+            ++m_idx_selected;
+        it = m_presets.insert(it, std::move(saved));
+    }
+    Preset &preset = *it;
+    const std::string final_inherits = preset.inherits();
+
+    // Перезапись самостоятельного пользовательского родителя обновляет разрешённые значения его детей.
+    if (preset_existed && final_inherits.empty()) {
+        for (auto &child : m_presets) {
+            if (child.inherits() == preset.name && (source_name == target_name || child.name != source_name)) {
+                if (scoped && child.is_project_embedded) {
+                    child.config = preset.config;
+                    child.config.apply(project_child_overrides.at(child.name));
+                } else {
+                    child.reload(preset);
+                }
+            }
+        }
+    }
+    guard.unlock();
     // 2) Activate the saved preset.
-    this->select_preset_by_name(new_name, true);
+    this->select_preset_by_name(target_name, true);
     // 2) Store the active preset to disk.
     //BBS: only save difference for user preset
     Preset* parent_preset = nullptr;
@@ -3084,27 +3191,17 @@ void PresetCollection::save_current_preset(const std::string &new_name, bool det
 
     {
         LifecycleEventContext ctx;
-        ctx.name  = new_name;
+        ctx.name  = target_name;
         ctx.msg = preset_existed ? "overwrite" : "new";
         ctx.code = LifecycleEvtCode::Ok;
         fire_lifecycle_event(LifecycleEvent::PresetSaved, ctx);
     }
 }
 
-// A detached standalone preset for the Full Publish receiver: create a user preset holding
-// the full resolved filament config (no inheritance, no vendor/alias links), parentless.
-// Note: universal printer compatibility is not enforced here - callers apply
-// make_publish_universal() to the config before handing it over when they need it.
-// Mirrors save_current_preset(detach=true)'s creation branch but does not force-select or
-// diff against a parent; the caller decides whether to select it.
-// The published entry's filament_id is forwarded so user bases keep their stable
-// material grouping (get_filament_presets() groups user bases by filament_id).
-// The copy is a project-embedded preset: it lives inside the loaded project only
-// (serialized into the saved .3mf, restored by load_project_embedded_presets) and
-// never touches the user's library directory; Preset::save() early-returns for
-// embedded presets, so persistence is skipped here too.
-// Returns the final (uniquified) name; on collision "<base>" -> "<base> (Published)" ->
-// "<base> (Published 2)" ...
+// Добавляет самостоятельную проектную запись без выбора и без записи пользовательского JSON.
+// Конфликты разрешаются только в проектной области; результат — полный ключ для ссылок проекта.
+// Полная конфигурация не наследует родителя, поставщика или псевдоним; `filament_id` сохраняет группировку материала.
+// Совместимость задаёт вызывающий код через `make_publish_universal()`, если нужна доступность для всех принтеров.
 std::string PresetCollection::add_detached_preset(const std::string &name_base, DynamicPrintConfig config,
                                                   const std::string &filament_id)
 {
@@ -3115,7 +3212,7 @@ std::string PresetCollection::add_detached_preset(const std::string &name_base, 
     stored.filament_id = filament_id;
 
     // Uniquify verbatim; only on collision append " (Published)" then " (Published 2)".
-    const std::string base_name = name_base;
+    const std::string base_name = saved_preset_name(name_base, true);
     std::string       final_name = base_name;
     auto exists = [this](const std::string &candidate) -> bool {
         const auto it = this->find_preset_internal(candidate);
@@ -3127,8 +3224,7 @@ std::string PresetCollection::add_detached_preset(const std::string &name_base, 
             final_name = base_name + " (Published " + std::to_string(i) + ")";
     }
 
-    // Creation branch of save_current_preset(detach=true), without its selection side
-    // effects or project-embedded path.
+    // Вставка сдвигает индекс, но не меняет выбранную запись и не записывает профиль на диск.
     lock();
     const auto it = this->find_preset_internal(final_name);
     if (m_presets.begin() + m_idx_selected >= it)
@@ -3146,7 +3242,7 @@ std::string PresetCollection::add_detached_preset(const std::string &name_base, 
     preset.is_system   = false;
     preset.is_external = false;
     preset.bundle_id.clear();
-    preset.file                = this->path_for_preset(preset);
+    preset.file                = Preset::uses_project_namespace(m_type) ? std::string() : this->path_for_preset(preset);
     preset.is_visible          = true;
     preset.is_project_embedded = true;
     if (m_type == Preset::TYPE_PRINT)
@@ -3386,8 +3482,8 @@ const std::string& PresetCollection::get_suffix_modified() {
     return g_suffix_modified;
 }
 
-// Return a preset by its name. If the preset is active, a temporary copy is returned.
-// If a preset was not found by its name, null is returned.
+// Ищет канонический ключ; для активной записи `real == false` возвращает отредактированную копию.
+// Отсутствие записи даёт `nullptr`, кроме явно запрошенного `first_visible_if_not_found`.
 Preset* PresetCollection::find_preset(const std::string &name, bool first_visible_if_not_found, bool real, bool only_from_library)
 {
     const ParsedName  parsed    = parse_preset_name(name);
@@ -3401,15 +3497,19 @@ Preset* PresetCollection::find_preset(const std::string &name, bool first_visibl
     // real/only_from_library or first_visible_if_not_found - resolves to the renamed preset
     // rather than a mismatched one. Recursion follows multi-step renames (A->B->C) and
     // terminates as soon as a name resolves or has no further rename entry.
-    if (const std::string* renamed = get_preset_name_renamed(name))
-        return find_preset(*renamed, first_visible_if_not_found, real, only_from_library);
+    // Проектный ключ не может обозначать переименованный системный профиль из другой области.
+    if (parsed.kind != PresetOrigin::Kind::Project)
+        if (const std::string* renamed = get_preset_name_renamed(name))
+            return find_preset(*renamed, first_visible_if_not_found, real, only_from_library);
     return first_visible_if_not_found ? &this->first_visible() : nullptr;
 }
 
+// Дополняет точный поиск подбором библиотечного материала только для непроектных имён.
+// Полный проектный ключ разрешается в свою запись либо даёт `nullptr`, без подмены областью библиотеки.
 Preset* PresetCollection::find_preset2(const std::string& name, bool auto_match/* = true */)
 {
     auto preset = find_preset(name, false, true);
-    if (preset == nullptr) {
+    if (preset == nullptr && parse_preset_name(name).kind != PresetOrigin::Kind::Project) {
         if (auto_match) {
             //Orca: one more try, find the most likely preset in OrcaFilamentLibrary
             if (name.find("Generic") != std::string::npos) {

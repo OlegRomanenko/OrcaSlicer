@@ -1,3 +1,5 @@
+# Регистрирует тесты ядра, включая файловые регрессии сохранения профилей.
+# Использует общие зависимости и обнаружение Catch2; GUI-зависимые проверки добавляются только при наличии GUI.
 get_filename_component(_TEST_NAME ${CMAKE_CURRENT_LIST_DIR} NAME)
 
 add_executable(${_TEST_NAME}_tests
@@ -18,6 +20,7 @@ add_executable(${_TEST_NAME}_tests
     test_preset_bundle_loading.cpp
     test_preset_setting_id.cpp
     test_preset_diff.cpp
+    test_preset_saving.cpp
     test_vendor_cache.cpp
     test_preset_options.cpp
     test_elephant_foot_compensation.cpp

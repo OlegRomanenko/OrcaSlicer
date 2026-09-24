@@ -1,3 +1,6 @@
+// Диалог проверяет имена и собирает параметры сохранения, но не записывает конфигурацию профиля.
+// Выбор принадлежит текущему открытию окна; для пластика и FFF-печати по умолчанию выбраны библиотека и `detach`.
+// Подтверждение перезаписи этих типов сохраняет запись назначения и её облачную идентичность до фактической записи.
 #include "SavePresetDialog.hpp"
 
 #include <cstddef>
@@ -9,6 +12,7 @@
 #include <wx/sizer.h>
 #include <wx/stattext.h>
 #include <wx/wupdlock.h>
+#include <wx/msgdlg.h>
 
 #include "libslic3r/PresetBundle.hpp"
 
@@ -29,6 +33,8 @@ namespace Slic3r { namespace GUI {
 //          SavePresetDialog::Item
 //-----------------------------------------------
 
+// Создаёт поля одного типа профиля из выбранной коллекции приложения; виджетами владеет диалог.
+// Начальные значения задаются один раз; переход к другому свободному имени сохраняет ручной выбор пользователя.
 SavePresetDialog::Item::Item(Preset::Type type, const std::string &suffix, wxBoxSizer *sizer, SavePresetDialog *parent) : m_type(type), m_parent(parent)
 {
     Tab *tab = wxGetApp().get_tab(m_type);
@@ -36,7 +42,10 @@ SavePresetDialog::Item::Item(Preset::Type type, const std::string &suffix, wxBox
     m_presets = tab->get_presets();
 
     const Preset &sel_preset  = m_presets->get_selected_preset();
+    m_detach = Preset::uses_project_namespace(m_type);
     std::string   preset_name = sel_preset.is_default ? "Untitled" : sel_preset.is_system ? (boost::format(("%1% - %2%")) % sel_preset.name % suffix).str() : sel_preset.is_from_bundle() && !sel_preset.alias.empty() ? sel_preset.alias : sel_preset.name;
+    if (Preset::uses_project_namespace(m_type) && sel_preset.is_project_embedded)
+        preset_name = get_preset_bare_name(sel_preset.name);
 
     // if name contains extension
     if (boost::iends_with(preset_name, ".ini")) {
@@ -111,7 +120,8 @@ SavePresetDialog::Item::Item(Preset::Type type, const std::string &suffix, wxBox
 
     sizer->Add(m_radio_group, 0, wxEXPAND | wxTOP | wxLEFT, BORDER_W);
 
-    if (parent->m_mode == comDevelop) {
+    // Значения по умолчанию обоих типов должны быть доступны для отмены в любом режиме интерфейса.
+    if (Preset::uses_project_namespace(m_type) || parent->m_mode == comDevelop) {
         // A new user copy of a system preset inherits from the selected system preset.
         const std::string parent_name = sel_preset.is_system ? sel_preset.name : sel_preset.inherits();
         const bool        has_parent  = !parent_name.empty();
@@ -133,7 +143,14 @@ SavePresetDialog::Item::Item(Preset::Type type, const std::string &suffix, wxBox
         sizer->Add(detach_sizer, 0, wxEXPAND | wxTOP, BORDER_W);
         sizer->AddSpacer(FromDIP(5));
 
-        const wxString parent_text = has_parent ? from_u8(parent_name) : _L("Unique preset");
+        wxString parent_text = has_parent ? from_u8(parent_name) : _L("Unique preset");
+        if (has_parent && Preset::uses_project_namespace(m_type)) {
+            if (const Preset *parent_preset = m_presets->find_preset(parent_name, false, true)) {
+                parent_text = from_u8(parent_preset->label(false));
+                if (parent_preset->can_overwrite())
+                    parent_text += " [" + (parent_preset->is_project_embedded ? _L("Preset Inside Project") : _L("User Preset")) + "]";
+            }
+        }
         auto parent_label          = new wxStaticText(parent, wxID_ANY, parent_text);
         parent_label->SetFont(::Label::Body_12);
         parent_label->SetForegroundColour(wxColour("#6B6B6B"));
@@ -142,7 +159,7 @@ SavePresetDialog::Item::Item(Preset::Type type, const std::string &suffix, wxBox
 
         sizer->AddSpacer(FromDIP(5));
 
-        // Set initial state (unchecked by default)
+        // Применяем начальное значение только при создании, не при каждом изменении имени.
         detach_checkbox->SetValue(m_detach);
         // Bind the checkbox event to update the detach state for this item
         detach_checkbox->Bind(wxEVT_TOGGLEBUTTON, [this, detach_checkbox](wxCommandEvent& event) {
@@ -162,16 +179,20 @@ SavePresetDialog::Item::Item(Preset::Type type, const std::string &suffix, wxBox
     
     m_radio_group->Bind(wxEVT_COMMAND_RADIOBOX_SELECTED, [this](wxCommandEvent &e) {
         m_save_to_project = m_radio_group->GetSelection() == 1;
+        update();
     });
 
     bool is_project_embedded = m_presets->get_edited_preset().is_project_embedded;
-    m_radio_group->SetSelection(is_project_embedded ? 1 : 0);
+    m_save_to_project = !Preset::uses_project_namespace(m_type) && is_project_embedded;
+    m_radio_group->SetSelection(m_save_to_project ? 1 : 0);
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", create item: type" << Preset::get_type_string(m_type) << ", preset " << m_preset_name
                             << ", is_project_embedded = " << is_project_embedded;
     update();
 }
 
+// Проверяет имя и предупреждает о перезаписи; не сохраняет профиль.
+// Для пластика и FFF-печати конфликт определяется в области назначения; выбор области остаётся свободным.
 void SavePresetDialog::Item::update()
 {
     m_preset_name = into_u8(m_input_ctrl->GetTextCtrl()->GetValue());
@@ -201,13 +222,14 @@ void SavePresetDialog::Item::update()
         m_valid_type = NoValid;
     }
 
-    const Preset *existing = m_presets->find_preset(m_preset_name, false);
-    if (m_valid_type == Valid && existing && !existing->can_overwrite()) {
+    const Preset *reserved = m_presets->find_preset(m_preset_name, false);
+    const Preset *existing = m_presets->find_preset(preset_name(), false);
+    if (m_valid_type == Valid && ((existing && !existing->can_overwrite()) || (reserved && !reserved->can_overwrite()))) {
         info_line = _L("Overwriting a system profile is not allowed.");
         m_valid_type = NoValid;
     }
 
-    if (m_valid_type == Valid && existing && m_preset_name != m_presets->get_selected_preset_name()) {
+    if (m_valid_type == Valid && m_presets->save_requires_confirmation(m_preset_name, m_save_to_project)) {
         if (existing->is_compatible)
             info_line = from_u8((boost::format(_u8L("Preset \"%1%\" already exists.")) % m_preset_name).str());
         else
@@ -236,8 +258,8 @@ void SavePresetDialog::Item::update()
         m_valid_type = NoValid;
     }
 
-    // BBS: add project embedded presets logic
-    if (existing) { // ORCA RadioGroup
+    // Для остальных типов сохраняется штатное ограничение области существующей записи.
+    if (existing && !Preset::uses_project_namespace(m_type)) {
         if (existing->is_project_embedded) {
             m_radio_group->SetSelection(1);
             m_save_to_project = true;
@@ -267,8 +289,12 @@ void SavePresetDialog::Item::update_valid_bmp()
     m_valid_bmp->SetBitmap(create_scaled_bitmap(bmp_name, m_parent));
 }
 
+// Для пластика и печати это только подтверждение выбора: коллекция обновит назначение без его удаления.
+// Для остальных типов сохраняется прежняя процедура удаления заменяемого профиля.
 void SavePresetDialog::Item::accept()
 {
+    if (Preset::uses_project_namespace(m_type))
+        return;
     if (m_valid_type == Warning) {
         auto    it               = m_presets->find_preset(m_preset_name, false);
         Preset &current_preset   = *it;
@@ -354,17 +380,18 @@ std::string SavePresetDialog::get_name(Preset::Type type)
     return "";
 }
 
-void SavePresetDialog::input_name_from_other(std::string new_preset_name) {
+// Служебный путь задаёт имя и область явно, не принимая пользовательские значения по умолчанию.
+void SavePresetDialog::input_name_from_other(std::string new_preset_name, bool save_to_project) {
     //only work for one-item
     Item* curr_item = m_items[0];
-    curr_item->m_input_ctrl->GetTextCtrl()->SetValue(new_preset_name);
+    curr_item->m_save_to_project = save_to_project;
+    curr_item->m_input_ctrl->GetTextCtrl()->SetValue(from_u8(curr_item->m_presets->saved_preset_name(new_preset_name, false)));
+    curr_item->update();
 }
 
-void SavePresetDialog::confirm_from_other() {
-    for (Item *item : m_items) {
-        item->accept();
-        if (item->type() == Preset::TYPE_PRINTER) update_physical_printers(item->preset_name());
-    }
+// Программно заданное имя проходит ту же проверку и подтверждение; отмена сообщается вызывающему коду.
+bool SavePresetDialog::confirm_from_other() {
+    return accept_items();
 }
 
 // BBS: add project relate
@@ -492,14 +519,33 @@ void SavePresetDialog::update_physical_printers(const std::string &preset_name)
     }
 }
 
-void SavePresetDialog::accept(wxCommandEvent &event)
+// Сначала подтверждает все конфликты, затем выполняет действия принятия. Отказ не меняет ни одну запись.
+bool SavePresetDialog::accept_items()
 {
+    for (Item *item : m_items)
+        item->update();
+    if (!enable_ok_btn())
+        return false;
+    for (Item *item : m_items) {
+        if (Preset::uses_project_namespace(item->type()) && item->m_valid_type == Item::Warning) {
+            wxMessageDialog confirmation(this, item->m_valid_label->GetLabel() + "\n" + _L("Do you want to continue?"),
+                _L("Save preset"), wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
+            if (confirmation.ShowModal() != wxID_YES)
+                return false;
+        }
+    }
     for (Item *item : m_items) {
         item->accept();
         if (item->type() == Preset::TYPE_PRINTER) update_physical_printers(item->preset_name());
     }
+    return true;
+}
 
-    EndModal(wxID_OK);
+// Закрывает диалог только после допустимого и подтверждённого выбора назначения.
+void SavePresetDialog::accept(wxCommandEvent &event)
+{
+    if (accept_items())
+        EndModal(wxID_OK);
 }
 
 }} // namespace Slic3r::GUI

@@ -1,6 +1,8 @@
 #ifndef slic3r_PresetBundle_hpp_
 #define slic3r_PresetBundle_hpp_
 
+// Объединяет коллекции профилей и конфигурацию проекта; отвечает за загрузку, выбор и совместимость.
+// Сохранение выбранных изменений принимает явные параметры операции и может записывать пользовательские файлы.
 #include "Preset.hpp"
 #include "PresetCacheFormat.hpp"
 #include "AppConfig.hpp"
@@ -356,7 +358,10 @@ public:
     bool backup_user_folder() const;
 
     //BBS: project embedded preset logic
-    PresetsConfigSubstitutions load_project_embedded_presets(std::vector<Preset*> project_presets, ForwardCompatibilitySubstitutionRule substitution_rule);
+    // Загружает отдельные проектные записи. `project_config`, если передан, получает миграцию
+    // старых неквалифицированных ссылок выбора и наследования; пользовательские записи не меняются.
+    PresetsConfigSubstitutions load_project_embedded_presets(std::vector<Preset*> project_presets,
+        ForwardCompatibilitySubstitutionRule substitution_rule, DynamicPrintConfig *project_config = nullptr);
     std::vector<Preset*> get_current_project_embedded_presets();
     void reset_project_embedded_presets();
 
@@ -582,10 +587,12 @@ public:
     const std::string&          get_preset_name_by_alias(const Preset::Type& preset_type, const std::string& alias) const;
 
     const int                   get_required_hrc_by_filament_type(const std::string& filament_type) const;
-    // Save current preset of a provided type under a new name. If the name is different from the old one,
-    // Unselected option would be reverted to the beginning values
-    //BBS: add project embedded preset logic
-    void                        save_changes_for_preset(const std::string& new_name, Preset::Type type, const std::vector<std::string>& unselected_options, bool save_to_project = false);
+    // Сохраняет текущий профиль указанного типа, предварительно возвращая исключённые параметры к исходным.
+    // Тип сохранения и `detach` передаются без подмены; после записи обновляются совместимость и слоты исходного профиля.
+    // Непустой `source_name` обязан совпадать с текущим ключом: иначе сохранение отклоняется до изменения параметров.
+    void                        save_changes_for_preset(const std::string& new_name, Preset::Type type,
+        const std::vector<std::string>& unselected_options, bool save_to_project = false, bool detach = false,
+        const std::string &source_name = std::string());
 
     std::pair<PresetsConfigSubstitutions, std::string> load_system_models_from_json(ForwardCompatibilitySubstitutionRule compatibility_rule);
     std::pair<PresetsConfigSubstitutions, std::string> load_system_filaments_json(ForwardCompatibilitySubstitutionRule compatibility_rule);
