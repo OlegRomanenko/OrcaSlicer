@@ -763,3 +763,202 @@ TEST_CASE("Saving selected filament changes remaps only slots with the exact sou
     CHECK(presets.find_preset("Shared", false, true)->is_user());
     CHECK(presets.find_preset("_project/Shared", false, true)->is_project_embedded);
 }
+
+// Пересчёт совместимости и удаление последнего принтера не меняют библиотеку и проектные копии.
+// Облачный обработчик заменён сборщиком имён: только удаляемый принтер может попасть в его очередь.
+TEST_CASE("Удаление всех принтеров сохраняет библиотеку и проектные профили", "[PresetDeletion][Regression]")
+{
+    const auto type = GENERATE(Preset::TYPE_FILAMENT, Preset::TYPE_PRINT);
+    const int compatibility = GENERATE(0, 1, 2, 3);
+    const bool inherited_printer = GENERATE(false, true);
+    CAPTURE(type, compatibility, inherited_printer);
+    ScopedTemporaryDir temp;
+    PresetBundle bundle;
+    load_user_presets(bundle.printers, temp.path(), PRESET_PRINTER_NAME);
+    for (const std::string name : {"Printer A", "Printer B"}) {
+        bundle.printers.get_edited_preset().config.set_key_value("printer_model", new ConfigOptionString("Fork Test"));
+        bundle.printers.save_current_preset(name, name != "Printer B" || !inherited_printer, false);
+    }
+
+    PresetCollection &profiles = type == Preset::TYPE_FILAMENT ? bundle.filaments : bundle.prints;
+    load_user_presets(profiles, temp.path(), Preset::get_type_string(type));
+    auto &config = profiles.get_edited_preset().config;
+    const std::vector<std::string> compatible = compatibility == 1 ? std::vector<std::string>{"Printer A"} :
+                                               compatibility == 2 ? std::vector<std::string>{"Printer A", "Printer B"} :
+                                                                    std::vector<std::string>{};
+    config.set_key_value("compatible_printers", new ConfigOptionStrings(compatible));
+    config.set_key_value("compatible_printers_condition", new ConfigOptionString(compatibility == 3 ? "printer_model == \"Fork Test\"" : ""));
+    profiles.save_current_preset("Library", true, false);
+    profiles.get_selected_preset().setting_id = "library-cloud-id";
+    profiles.get_selected_preset().save_info();
+    profiles.select_preset_by_name("Library", true);
+    profiles.save_current_preset("Child", false, false);
+    profiles.save_current_preset("Project copy", true, true);
+    const std::vector<Preset> before{*profiles.find_preset("Library"), *profiles.find_preset("Child"),
+                                     *profiles.find_preset("_project/Project copy")};
+    const auto library_json = saved_file_contents(before[0].file);
+    const auto child_json = saved_file_contents(before[1].file);
+    const auto info_path = fs::path(before[0].file).replace_extension(".info");
+    const auto library_info = saved_file_contents(info_path);
+    std::vector<std::string> cloud_deletions;
+    // Удаляем потомка раньше родителя; проверяем как самостоятельный, так и унаследованный Printer B.
+    for (const std::string name : {"Printer B", "Printer A"}) {
+        bundle.printers.select_preset_by_name(name, true);
+        REQUIRE(bundle.printers.delete_current_preset([&](const Preset &selected) { cloud_deletions.push_back(selected.name); }));
+        bundle.update_compatible(PresetSelectCompatibleType::Always);
+        for (const Preset &original : before) {
+            const Preset *remaining = profiles.find_preset(original.name, false, true);
+            REQUIRE(remaining != nullptr);
+            CHECK(remaining->config.diff(original.config).empty());
+            CHECK(remaining->setting_id == original.setting_id);
+            CHECK(remaining->sync_info == original.sync_info);
+            CHECK(remaining->is_project_embedded == original.is_project_embedded);
+        }
+        CHECK(saved_file_contents(before[0].file) == library_json);
+        CHECK(saved_file_contents(before[1].file) == child_json);
+        CHECK(saved_file_contents(info_path) == library_info);
+    }
+    CHECK(cloud_deletions == std::vector<std::string>{"Printer B", "Printer A"});
+    CHECK(bundle.printers.only_default_printers());
+
+    PresetBundle reloaded;
+    auto &reloaded_profiles = type == Preset::TYPE_FILAMENT ? reloaded.filaments : reloaded.prints;
+    load_user_presets(reloaded.printers, temp.path(), PRESET_PRINTER_NAME);
+    load_user_presets(reloaded_profiles, temp.path(), Preset::get_type_string(type));
+    CHECK(reloaded.printers.only_default_printers());
+    REQUIRE(reloaded_profiles.find_preset("Library", false) != nullptr);
+    REQUIRE(reloaded_profiles.find_preset("Child", false) != nullptr);
+    reloaded.printers.get_edited_preset().config.set_key_value("printer_model", new ConfigOptionString("Fork Test"));
+    reloaded.printers.save_current_preset("Printer A", true, false);
+    reloaded.update_compatible(PresetSelectCompatibleType::Always);
+    CHECK(reloaded_profiles.find_preset("Library")->is_compatible);
+    CHECK(reloaded_profiles.find_preset("Child")->is_compatible);
+    CHECK(saved_file_contents(before[0].file) == library_json);
+    CHECK(saved_file_contents(before[1].file) == child_json);
+
+    // Родитель защищён от удаления, а явное удаление дочерней записи не затрагивает соседей.
+    reloaded_profiles.select_preset_by_name("Library", true);
+    REQUIRE_FALSE(reloaded_profiles.delete_current_preset([&](const Preset &selected) { cloud_deletions.push_back(selected.name); }));
+    CHECK(cloud_deletions.size() == 2);
+    reloaded_profiles.select_preset_by_name("Child", true);
+    REQUIRE(reloaded_profiles.delete_current_preset([&](const Preset &selected) { cloud_deletions.push_back(selected.name); }));
+    CHECK(cloud_deletions.back() == "Child");
+    CHECK_FALSE(fs::exists(before[1].file));
+    CHECK(saved_file_contents(before[0].file) == library_json);
+}
+
+// Отвязка последнего профиля сохраняет устройство и сериализует пустой список, включая старое поле.
+// Повторная загрузка и добавление новой связи не должны восстанавливать удалённую связь или терять настройки.
+TEST_CASE("Физические принтеры не удаляются вместе с последним профилем", "[PresetDeletion][Regression]")
+{
+    ScopedTemporaryDir temp;
+    fs::create_directory(temp.path() / "physical");
+    PhysicalPrinterCollection printers(PhysicalPrinter::printer_options());
+    PresetsConfigSubstitutions substitutions;
+    printers.load_printers(temp.string(), "physical", substitutions, ForwardCompatibilitySubstitutionRule::Disable);
+    for (const std::string name : {"Solo", "Shared", "Other"}) {
+        PhysicalPrinter printer(name, printers.default_config());
+        printer.config.set_key_value("print_host", new ConfigOptionString("http://192.0.2.1"));
+        printer.add_preset(name == "Other" ? "Printer B" : "Printer A");
+        if (name == "Shared")
+            printer.add_preset("Printer B");
+        printers.save_printer(printer);
+    }
+    const auto other_file = printers.find_printer("Other")->file;
+    const auto other_contents = saved_file_contents(other_file);
+    REQUIRE(printers.delete_preset_from_printers("Printer A"));
+    REQUIRE(printers.find_printer("Solo") != nullptr);
+    CHECK(printers.find_printer("Solo")->preset_names.empty());
+    CHECK(printers.find_printer("Shared")->preset_names == std::set<std::string>{"Printer B"});
+    CHECK(saved_file_contents(other_file) == other_contents);
+
+    PhysicalPrinterCollection reloaded(PhysicalPrinter::printer_options());
+    reloaded.load_printers(temp.string(), "physical", substitutions, ForwardCompatibilitySubstitutionRule::Disable);
+    REQUIRE(substitutions.empty());
+    REQUIRE(reloaded.find_printer("Solo") != nullptr);
+    auto solo = *reloaded.find_printer("Solo");
+    CHECK(solo.preset_names.empty());
+    CHECK(solo.config.option<ConfigOptionStrings>("preset_names")->values.empty());
+    CHECK(solo.config.option<ConfigOptionString>("preset_name")->value.empty());
+    CHECK(solo.config.option<ConfigOptionString>("print_host")->value == "http://192.0.2.1");
+    reloaded.select_printer("Solo");
+    CHECK_FALSE(reloaded.has_selection());
+    solo.add_preset("Printer B");
+    reloaded.save_printer(solo);
+    reloaded.select_printer("Solo");
+    CHECK(reloaded.get_selected_printer_preset_name() == "Printer B");
+    REQUIRE(reloaded.delete_selected_printer());
+    CHECK(reloaded.find_printer("Solo") == nullptr);
+    CHECK(reloaded.find_printer("Shared") != nullptr);
+    CHECK(saved_file_contents(other_file) == other_contents);
+}
+
+// Пользовательская и проектная копии проходят реальное сохранение/detach и экспорт `.3mf`.
+// Физический тип, признак поддержки и параметры экструзии сохраняются без специальных идентификаторов.
+TEST_CASE("PLA поддержки сохраняется при detach и переносе через проект", "[PresetSaving][FilamentSupportType][3mf][Regression]")
+{
+    ScopedTemporaryDir temp;
+    PresetBundle bundle;
+    load_user_presets(bundle.filaments, temp.path(), PRESET_FILAMENT_NAME);
+    add_system_filament(bundle);
+    bundle.filaments.select_preset_by_name("System PLA", true);
+    auto &config = bundle.filaments.get_edited_preset().config;
+    config.set_key_value("filament_type", new ConfigOptionStrings{"PLA"});
+    config.set_key_value("filament_is_support", new ConfigOptionBools{true});
+    config.set_key_value("nozzle_temperature", new ConfigOptionInts{220});
+    config.set_key_value("filament_flow_ratio", new ConfigOptionFloats{0.97});
+    bundle.filaments.save_current_preset("PLA Support", true, false);
+    bundle.filaments.save_current_preset("PLA Support", true, true);
+    Preset embedded = bundle.filaments.get_selected_preset();
+    CHECK(embedded.inherits().empty());
+    ScopedTemporaryFile archive(".3mf");
+    ImportedProjectData imported;
+    DynamicPrintConfig loaded_config;
+    auto project_config = DynamicPrintConfig::full_print_config();
+    project_config.apply(embedded.config);
+    roundtrip_project(archive.string(), project_config, {&embedded}, loaded_config, imported);
+    REQUIRE(imported.presets.size() == 1);
+    std::string displayed;
+    auto &loaded = imported.presets.front()->config;
+    CHECK(loaded.get_filament_type(displayed) == "PLA");
+    CHECK(displayed == "PLA");
+    CHECK(loaded.option<ConfigOptionBools>("filament_is_support")->get_at(0));
+    CHECK(loaded.option<ConfigOptionInts>("nozzle_temperature")->get_at(0) == 220);
+    CHECK_THAT(loaded.option<ConfigOptionFloats>("filament_flow_ratio")->get_at(0), Catch::Matchers::WithinAbs(0.97, 1e-9));
+    PresetBundle reloaded;
+    load_user_presets(reloaded.filaments, temp.path(), PRESET_FILAMENT_NAME);
+    REQUIRE(reloaded.filaments.find_preset("PLA Support", false) != nullptr);
+    auto &user = reloaded.filaments.find_preset("PLA Support")->config;
+    CHECK(user.get_filament_type(displayed) == "PLA");
+    CHECK(user.option<ConfigOptionBools>("filament_is_support")->get_at(0));
+}
+
+// Старая пользовательская копия без переопределённого типа получает явный PLA-S от обновлённой базы.
+// Намеренное переопределение обратно в обычный PLA при этом не отменяется наследованием.
+TEST_CASE("Пользовательский наследник получает явный тип специального материала из базы", "[PresetSaving][FilamentSupportType][Regression]")
+{
+    ScopedTemporaryDir temp;
+    PresetBundle original;
+    add_system_filament(original);
+    original.filaments.find_preset("System PLA")->config.set_key_value("filament_is_support", new ConfigOptionBools{true});
+    load_user_presets(original.filaments, temp.path(), PRESET_FILAMENT_NAME);
+    original.filaments.select_preset_by_name("System PLA", true);
+    original.filaments.save_current_preset("Support copy", false, false);
+
+    PresetBundle updated;
+    add_system_filament(updated);
+    auto &base = updated.filaments.find_preset("System PLA")->config;
+    base.set_key_value("filament_type", new ConfigOptionStrings{"PLA-S"});
+    base.set_key_value("filament_is_support", new ConfigOptionBools{true});
+    load_user_presets(updated.filaments, temp.path(), PRESET_FILAMENT_NAME);
+    updated.filaments.select_preset_by_name("Support copy", true);
+    auto &copy = updated.filaments.get_edited_preset();
+    REQUIRE(copy.inherits() == "System PLA");
+    std::string displayed;
+    CHECK(copy.get_filament_type(displayed) == "PLA-S");
+    CHECK(displayed == "Sup.PLA");
+    copy.config.set_key_value("filament_type", new ConfigOptionStrings{"PLA"});
+    updated.filaments.save_current_preset("Support copy", false, false);
+    CHECK(updated.filaments.get_selected_preset().config.get_filament_type(displayed) == "PLA");
+    CHECK(displayed == "PLA");
+}

@@ -1,5 +1,6 @@
 // Показывает различия профилей и собирает решение о сохранении, переносе или отмене изменений.
 // Диалог передаёт имя, тип сохранения и `detach` вызывающему коду; перенос без сохранения не меняет эти связи.
+// Сравнение и перенос используют канонические ключи `ItemAlias`, независимо от видимых пометок области.
 #include "UnsavedChangesDialog.hpp"
 
 #include <cstddef>
@@ -1762,11 +1763,15 @@ static PresetCollection* get_preset_collection(Preset::Type type, PresetBundle* 
 //------------------------------------------
 //          DiffPresetDialog
 //------------------------------------------
+// Возвращает полный ключ выбранной записи, а не локализованную подпись списка.
+// Отсутствующий выбор и служебные строки без `ItemAlias` не обозначают другой профиль.
 static std::string get_selection(PresetComboBox* preset_combo)
 {
-    return into_u8(preset_combo->GetString(preset_combo->GetSelection()));
+    const int selection = preset_combo->GetSelection();
+    return selection < 0 ? std::string{} : into_u8(preset_combo->GetItemAlias(selection));
 }
 
+// Создаёт независимые списки сторон сравнения; события выбора и кнопка равенства передают только полные ключи.
 void DiffPresetDialog::create_presets_sizer()
 {
     m_presets_sizer = new wxBoxSizer(wxVERTICAL);
@@ -1784,7 +1789,8 @@ void DiffPresetDialog::create_presets_sizer()
             PresetComboBox* cb = (*cb_);
             cb->set_selection_changed_function([this, new_type, preset_bundle, cb](int selection) {
                 if (m_view_type == Preset::TYPE_INVALID) {
-                    std::string preset_name = Preset::remove_suffix_modified(cb->GetString(selection).ToUTF8().data());
+                    // Используем индекс события: на macOS он различает имена, отличающиеся только регистром.
+                    std::string preset_name = into_u8(cb->GetItemAlias(selection));
                     update_compatibility(preset_name, new_type, preset_bundle);
                 }
                 update_tree();
@@ -1805,9 +1811,11 @@ void DiffPresetDialog::create_presets_sizer()
 
         equal_bmp->Bind(wxEVT_BUTTON, [presets_left, presets_right, this](wxEvent&) {
             std::string preset_name = get_selection(presets_left);
+            if (preset_name.empty())
+                return;
             presets_right->update(preset_name);
             if (m_view_type == Preset::TYPE_INVALID)
-                update_compatibility(Preset::remove_suffix_modified(preset_name), presets_right->get_type(), m_preset_bundle_right.get());
+                update_compatibility(preset_name, presets_right->get_type(), m_preset_bundle_right.get());
             update_tree();
         });
     }
@@ -2235,18 +2243,21 @@ void DiffPresetDialog::on_sys_color_changed()
     Refresh();
 }
 
+// Пересчитывает только копию пакета выбранной стороны. Неизвестный ключ не заменяется первым видимым профилем.
 void DiffPresetDialog::update_compatibility(const std::string& preset_name, Preset::Type type, PresetBundle* preset_bundle)
 {
     PresetCollection* presets = get_preset_collection(type, preset_bundle);
+    const Preset* selected = presets->find_preset(preset_name, false);
+    if (!selected)
+        return;
 
     bool print_tab = type == Preset::TYPE_PRINT || type == Preset::TYPE_SLA_PRINT;
     bool printer_tab = type == Preset::TYPE_PRINTER;
     bool technology_changed = false;
 
     if (printer_tab) {
-        const Preset& new_printer_preset = *presets->find_preset(preset_name, true);
         PrinterTechnology    old_printer_technology = presets->get_selected_preset().printer_technology();
-        PrinterTechnology    new_printer_technology = new_printer_preset.printer_technology();
+        PrinterTechnology    new_printer_technology = selected->printer_technology();
 
         technology_changed = old_printer_technology != new_printer_technology;
     }
@@ -2300,20 +2311,22 @@ void DiffPresetDialog::button_event(Action act)
         wxPostEvent(this, SimpleEvent(EVT_DIFF_DIALOG_TRANSFER));
 }
 
+// Возвращает ключ источника переноса для типа, присутствующего в диалоге, с сохранением проектной области.
 std::string DiffPresetDialog::get_left_preset_name(Preset::Type type)
 {
     PresetComboBox* cb = std::find_if(m_preset_combos.begin(), m_preset_combos.end(), [type](const DiffPresets& p) {
                              return p.presets_left->get_type() == type;
                          })->presets_left;
-    return Preset::remove_suffix_modified(get_selection(cb));
+    return get_selection(cb);
 }
 
+// Возвращает ключ назначения переноса; одинаковая подпись в другой области не является тем же профилем.
 std::string DiffPresetDialog::get_right_preset_name(Preset::Type type)
 {
     PresetComboBox* cb = std::find_if(m_preset_combos.begin(), m_preset_combos.end(), [type](const DiffPresets& p) {
                              return p.presets_right->get_type() == type;
                          })->presets_right;
-    return Preset::remove_suffix_modified(get_selection(cb));
+    return get_selection(cb);
 }
 
 }

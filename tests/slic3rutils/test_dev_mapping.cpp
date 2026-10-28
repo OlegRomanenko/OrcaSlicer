@@ -1,3 +1,5 @@
+// Проверяет реальный алгоритм выбора AMS на синтетическом состоянии устройства, без сети и GUI.
+// Тип из профиля передаётся тем же способом, что при подготовке отправки задания.
 // Match the include environment that libslic3r_gui TUs get from pchheader.hpp: Windows.h with
 // WIN32_LEAN_AND_MEAN/NOMINMAX must come first so rpcndr.h's `byte` is processed before <cstddef>
 // makes std::byte a competing candidate (otherwise the Windows COM headers pulled in via
@@ -192,4 +194,37 @@ TEST_CASE("Switch-bound AMS with an invalid track is excluded from mapping", "[D
     REQUIRE_FALSE(obj_no_switch.GetFilaSwitch()->IsInstalled());
     DevFilaSystemParser::ParseV1_0(print_push, &obj_no_switch, obj_no_switch.GetFilaSystem().get(), false);
     REQUIRE(obj_no_switch.GetFilaSystem()->GetAmsList().count("0") == 0);
+}
+
+// Галка поддержки не должна требовать специальной катушки для PLA/PETG, но PLA-S не равен PLA.
+// ParseV1_0 и ams_filament_mapping — производственные пути; сеть и профиль GUI не используются.
+TEST_CASE("AMS сопоставляет PLA поддержки по физическому типу", "[DevMapping][FilamentSupportType][Regression]")
+{
+    const std::string type = GENERATE(std::string{"PLA"}, std::string{"PETG"}, std::string{"PLA-S"});
+    const std::string tray_type = GENERATE(std::string{"PLA"}, std::string{"PETG"}, std::string{"PLA-S"});
+    const bool support = GENERATE(false, true);
+    CAPTURE(type, tray_type, support);
+    MachineObject obj(nullptr, nullptr, "test", "test_dev", "127.0.0.1");
+    json state = json::parse(R"({"ams":{"tray_exist_bits":"1","ams":[
+        {"id":"0","info":"00000001","tray":[{"id":"0","tray_color":"FF0000FF"}]}]}})");
+    DevFilaSystemParser::ParseV1_0(state, &obj, obj.GetFilaSystem().get(), false);
+    auto *tray = obj.GetFilaSystem()->GetAmsTray("0", "0");
+    REQUIRE(tray != nullptr);
+    tray->m_fila_type = tray_type;
+
+    DynamicPrintConfig config;
+    config.set_key_value("filament_type", new ConfigOptionStrings{type});
+    config.set_key_value("filament_is_support", new ConfigOptionBools{support});
+    std::string displayed;
+    FilamentInfo filament;
+    filament.id = 0;
+    filament.type = config.get_filament_type(displayed);
+    filament.color = "FF0000FF";
+    std::vector<bool> options(4, false);
+    options[MappingOption::USE_RIGHT_AMS] = true;
+    std::vector<FilamentInfo> result;
+    DevMappingUtil::ams_filament_mapping(&obj, {filament}, result, options, {}, false);
+    REQUIRE(result.size() == 1);
+    CHECK(result[0].tray_id == (type == tray_type ? 0 : -1));
+    CHECK(displayed == (type == "PLA-S" ? "Sup.PLA" : type));
 }

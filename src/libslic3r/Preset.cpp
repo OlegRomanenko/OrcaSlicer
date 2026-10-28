@@ -3256,7 +3256,9 @@ std::string PresetCollection::add_detached_preset(const std::string &name_base, 
     return final_name;
 }
 
-bool PresetCollection::delete_current_preset()
+// Удаляет одну выбранную запись. Внешнее действие выполняется после проверки запретов,
+// но до удаления файлов; обработчик не получает соседние или совместимые профили.
+bool PresetCollection::delete_current_preset(const std::function<void(const Preset&)>& before_delete)
 {
     Preset &selected = this->get_selected_preset();
     if (!selected.can_overwrite())
@@ -3267,6 +3269,9 @@ bool PresetCollection::delete_current_preset()
             if (preset2.inherits() == selected.name)
                 return false;
     }
+
+    if (before_delete)
+        before_delete(selected);
 
     //BBS: add project embedded preset logic and refine is_external
     //if (! selected.is_external && ! selected.is_system) {
@@ -4288,27 +4293,23 @@ const std::set<std::string>& PhysicalPrinter::get_preset_names() const
     return preset_names;
 }
 
-// temporary workaround for compatibility with older Slicer
+// Сериализует также пустой набор связей для совместимости со старым форматом.
 static void update_preset_name_option(const std::set<std::string>& preset_names, DynamicPrintConfig& config)
 {
     std::string name;
     for (auto el : preset_names)
         name += el + ";";
-    name.pop_back();
+    if (!name.empty())
+        name.pop_back();
     config.set_key_value("preset_name", new ConfigOptionString(name));
 }
 
+// Сохраняет снятие последней связи, а не оставляет старые имена в конфигурации устройства.
 void PhysicalPrinter::update_preset_names_in_config()
 {
-    if (!preset_names.empty()) {
-        std::vector<std::string>& values = config.option<ConfigOptionStrings>("preset_names")->values;
-        values.clear();
-        for (auto preset : preset_names)
-            values.push_back(preset);
-
-        // temporary workaround for compatibility with older Slicer
-        update_preset_name_option(preset_names, config);
-    }
+    std::vector<std::string>& values = config.option<ConfigOptionStrings>("preset_names")->values;
+    values.assign(preset_names.begin(), preset_names.end());
+    update_preset_name_option(preset_names, config);
 }
 
 void PhysicalPrinter::save(const std::string& file_name_from, const std::string& file_name_to)
@@ -4657,19 +4658,15 @@ bool PhysicalPrinterCollection::delete_selected_printer()
     return true;
 }
 
+// Удаляет только ссылки на профиль; даже устройство без оставшихся профилей сохраняется.
 bool PhysicalPrinterCollection::delete_preset_from_printers( const std::string& preset_name)
 {
-    std::vector<std::string> printers_for_delete;
     for (PhysicalPrinter& printer : m_printers) {
-        if (printer.preset_names.size() == 1 && *printer.preset_names.begin() == preset_name)
-            printers_for_delete.emplace_back(printer.name);
-        else if (printer.delete_preset(preset_name))
-            save_printer(printer);
+        if (printer.delete_preset(preset_name)) {
+            printer.update_preset_names_in_config();
+            printer.save(nullptr);
+        }
     }
-
-    if (!printers_for_delete.empty())
-        for (const std::string& printer_name : printers_for_delete)
-            delete_printer(printer_name);
 
     unselect_printer();
     return true;
@@ -4707,11 +4704,12 @@ std::string PhysicalPrinterCollection::get_selected_full_printer_name() const
     return (m_idx_selected == size_t(-1)) ? std::string() : this->get_selected_printer().get_full_name(m_selected_preset);
 }
 
+// Устройство без профилей остаётся в библиотеке, но не становится активным для печати.
 void PhysicalPrinterCollection::select_printer(const std::string& full_name)
 {
     std::string printer_name = PhysicalPrinter::get_short_name(full_name);
     auto it = this->find_printer_internal(printer_name);
-    if (it == m_printers.end()) {
+    if (it == m_printers.end() || it->name != printer_name || it->preset_names.empty()) {
         unselect_printer();
         return;
     }

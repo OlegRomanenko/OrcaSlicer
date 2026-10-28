@@ -18,6 +18,9 @@
 	"filament_density": [
 		"1.30"
 	],
+	"filament_type": [
+		"PLA-S"
+	],
 	"filament_is_support": [
 		"1"
 	],

@@ -1,3 +1,5 @@
+// Проверяет значения, преобразование типов и сериализацию конфигурации без GUI.
+// Файловые проверки используют временные каталоги; комплектные профили читаются без изменения.
 #include <catch2/catch_all.hpp>
 
 #include "libslic3r/PrintConfig.hpp"
@@ -1107,8 +1109,8 @@ TEST_CASE("read_cli accepts nil entries for a nullable vector option", "[Config]
     REQUIRE_THAT(opt->values[1], Catch::Matchers::WithinAbs(2.5, 1e-9));
 }
 
-// get_at() returns values.front() for an out-of-range index, so calling it on an empty vector
-// option is UB. filament_id and filament_is_support are unpopulated on a CLI from-scratch slice.
+// `get_at()` обращается к `front()` за пределами индекса: пустые `filament_id`
+// и `filament_is_support` из CLI должны обрабатываться как отсутствующие значения.
 TEST_CASE("get_filament_type treats empty vector options as absent", "[Config][Filament]")
 {
     DynamicPrintConfig config;
@@ -1128,13 +1130,13 @@ TEST_CASE("get_filament_type treats empty vector options as absent", "[Config][F
         REQUIRE(displayed == "PETG");
     }
 
-    SECTION("a support filament with an empty filament_id resolves from the type alone")
+    SECTION("PLA поддержки с пустым filament_id остаётся PLA")
     {
         config.set_key_value("filament_type", new ConfigOptionStrings({"PLA"}));
         config.set_key_value("filament_is_support", new ConfigOptionBools({true}));
         config.set_key_value("filament_id", new ConfigOptionStrings());
-        REQUIRE(config.get_filament_type(displayed, 0) == "PLA-S");
-        REQUIRE(displayed == "Sup.PLA");
+        REQUIRE(config.get_filament_type(displayed, 0) == "PLA");
+        REQUIRE(displayed == "PLA");
     }
 
     SECTION("a populated filament_id still selects the support type by id")
@@ -1145,6 +1147,97 @@ TEST_CASE("get_filament_type treats empty vector options as absent", "[Config][F
         REQUIRE(config.get_filament_type(displayed, 0) == "PLA-S");
         REQUIRE(displayed == "Sup.PLA");
     }
+}
+
+// Признак поддержки и скопированный идентификатор не превращают обычный PLA в специальный материал.
+// Снимок конфигурации фиксирует, что вычисление подписи не меняет имя, флаг и параметры профиля.
+TEST_CASE("Обычный PLA сохраняет тип независимо от признака поддержки и идентификатора", "[Config][FilamentSupportType][Regression]")
+{
+    const bool support = GENERATE(false, true);
+    const std::string id = GENERATE(std::string{}, std::string{"GFS00"}, std::string{"GFS01"}, std::string{"OFIfnzxC"});
+    DynamicPrintConfig config;
+    config.set_key_value("filament_type", new ConfigOptionStrings{"PLA"});
+    config.set_key_value("filament_is_support", new ConfigOptionBools{support});
+    config.set_key_value("filament_id", new ConfigOptionStrings{id});
+    config.set_key_value("filament_settings_id", new ConfigOptionStrings{"Мой PLA Support"});
+    config.set_key_value("nozzle_temperature", new ConfigOptionInts{220});
+    const DynamicPrintConfig before = config;
+    std::string displayed;
+    CAPTURE(support, id);
+    CHECK(config.get_filament_type(displayed) == "PLA");
+    CHECK(displayed == "PLA");
+    CHECK(config.diff(before).empty());
+}
+
+// Явно заданный специальный тип распознаётся без вывода по флагу или идентификатору производителя.
+TEST_CASE("Явный PLA-S остаётся специальным материалом при переключении признака поддержки", "[Config][FilamentSupportType][Regression]")
+{
+    const bool support = GENERATE(false, true);
+    DynamicPrintConfig config;
+    config.set_key_value("filament_type", new ConfigOptionStrings{"PLA-S"});
+    config.set_key_value("filament_is_support", new ConfigOptionBools{support});
+    config.set_key_value("filament_id", new ConfigOptionStrings{"GFS01"});
+    std::string displayed;
+    CHECK(config.get_filament_type(displayed) == "PLA-S");
+    CHECK(displayed == "Sup.PLA");
+}
+
+// В многоматериальной конфигурации признак второго слота не влияет на тип первого и наоборот.
+TEST_CASE("PETG и PLA поддержки сохраняют физические типы своих слотов", "[Config][FilamentSupportType][Regression]")
+{
+    DynamicPrintConfig config;
+    config.set_key_value("filament_type", new ConfigOptionStrings{"PETG", "PLA"});
+    config.set_key_value("filament_is_support", new ConfigOptionBools{false, true});
+    config.set_key_value("filament_id", new ConfigOptionStrings{});
+    std::string displayed;
+    CHECK(config.get_filament_type(displayed, 0) == "PETG");
+    CHECK(displayed == "PETG");
+    CHECK(config.get_filament_type(displayed, 1) == "PLA");
+    CHECK(displayed == "PLA");
+    config.set_key_value("filament_is_support", new ConfigOptionBools{true, false});
+    CHECK(config.get_filament_type(displayed, 0) == "PETG");
+    CHECK(displayed == "PETG");
+}
+
+// Сохранение и чтение отдельного JSON не должны возвращать подмену типа или снимать признак поддержки.
+TEST_CASE("PLA поддержки сохраняет тип и признак после чтения JSON", "[Config][FilamentSupportType][Regression]")
+{
+    DynamicPrintConfig config;
+    config.set_key_value("filament_type", new ConfigOptionStrings{"PLA"});
+    config.set_key_value("filament_is_support", new ConfigOptionBools{true});
+    config.set_key_value("filament_settings_id", new ConfigOptionStrings{"PLA Support"});
+    ScopedTemporaryFile file(".json");
+    config.save_to_json(file.string(), "PLA Support", "User", "2.5.0");
+    DynamicPrintConfig loaded;
+    ConfigSubstitutionContext substitutions{ForwardCompatibilitySubstitutionRule::Disable};
+    std::map<std::string, std::string> metadata;
+    std::string reason, displayed;
+    REQUIRE(loaded.load_from_json(file.string(), substitutions, true, metadata, reason) == 0);
+    REQUIRE(reason.empty());
+    CHECK(loaded.get_filament_type(displayed) == "PLA");
+    CHECK(displayed == "PLA");
+    CHECK(loaded.option<ConfigOptionBools>("filament_is_support")->get_at(0));
+    CHECK(loaded.option<ConfigOptionStrings>("filament_settings_id")->get_at(0) == "PLA Support");
+}
+
+// Комплектные специальные материалы должны объявлять собственный тип, а не полагаться на флаг PLA поддержки.
+TEST_CASE("Специальные поддержки Bambu явно объявляют тип PLA-S", "[Config][FilamentSupportType][Regression]")
+{
+    const std::string name = GENERATE(std::string{"Bambu Support W @base.json"},
+                                     std::string{"Bambu Support For PLA @base.json"},
+                                     std::string{"Bambu Support For PLA-PETG @base.json"});
+    DynamicPrintConfig config;
+    ConfigSubstitutionContext substitutions{ForwardCompatibilitySubstitutionRule::Disable};
+    std::map<std::string, std::string> metadata;
+    std::string reason, displayed;
+    CAPTURE(name);
+    REQUIRE(config.load_from_json(std::string(PROFILES_DIR) + "/BBL/filament/" + name,
+                                  substitutions, true, metadata, reason) == 0);
+    REQUIRE(reason.empty());
+    REQUIRE(config.has("filament_type"));
+    CHECK(config.option<ConfigOptionStrings>("filament_type")->get_at(0) == "PLA-S");
+    CHECK(config.get_filament_type(displayed) == "PLA-S");
+    CHECK(displayed == "Sup.PLA");
 }
 
 namespace {

@@ -390,12 +390,13 @@ wxString PresetComboBox::get_preset_item_name(unsigned int index)
     return GetString(index);
 }
 
-// Подписи самостоятельных областей различимы и вне раскрытого списка; системные и пакетные подписи не меняются.
+// Краткая пометка области различает одноимённые копии и не входит в ключ `ItemAlias`.
+// Системные и пакетные подписи не меняются.
 wxString PresetComboBox::with_storage_label(const Preset &preset, const wxString &label) const
 {
     if (!Preset::uses_project_namespace(preset.type) || !preset.can_overwrite())
         return label;
-    return label + " [" + (preset.is_project_embedded ? _L("Preset Inside Project") : _L("User Preset")) + "]";
+    return label + " [" + (preset.is_project_embedded ? _L("Preset Inside Project") : _L("User")) + "]";
 }
 
 // Обычный список показывает имя без служебной проектной квалификации, сохраняя область отдельной пометкой.

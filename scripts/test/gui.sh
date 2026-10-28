@@ -12,10 +12,13 @@ set -euo pipefail
 # --presets дополнительно открывает и переключает диалоги сохранения через
 # gui_presets.py; для него нужны Python 3, PyGObject и системный AT-SPI. Начальная
 # конфигурация с комплектными профилями создаётся только в каталоге теста.
+# --preset-deletion проверяет отмену и удаление двух тестовых принтеров, включая последний,
+# затем повторный запуск с той же библиотекой; использует тот же изолированный AT-SPI.
+# --compare проверяет открытие сравнения для пользовательских и проектных профилей.
 #
 # Процессы теста останавливаются при выходе, временные файлы и полные логи сохраняются.
 # Код 0 означает показ главного окна и пять успешных проверок работающего процесса;
-# При --presets код 0 также требует прохождения сценария диалогов.
+# При выборе сценария код 0 также требует прохождения его проверок.
 # Код 1 — сбой запуска/сценария, код 2 — неверные аргументы или отсутствие инструментов.
 
 self=$(realpath -- "${BASH_SOURCE[0]}")
@@ -37,9 +40,9 @@ stop_app() {
 
 # Выполняется только внутри нового Xvfb и D-Bus. Маркер после MainFrame::Show
 # исключает ложный успех по заставке; окно и живой процесс проверяются дополнительно.
-# Третий аргумент включает сценарий диалогов; его ошибки и завершение приложения не скрываются.
+# Третий аргумент выбирает сценарий; его ошибки и завершение приложения не скрываются.
 check_display() {
-    local appimage=$1 work=$2 presets=$3 ready=0
+    local appimage=$1 work=$2 scenario=$3 ready=0
     ulimit -c 0
     cd -- "$work/run"
     app_pid=
@@ -65,8 +68,8 @@ check_display() {
             ready=$((ready + 1))
             if ((ready == 5)); then
                 printf 'Главное окно показано, процесс работает, ошибок загрузки изображений нет. Логи: %s\n' "$work"
-                if ((presets)); then
-                    if ! python3 "$(dirname -- "$self")/gui_presets.py" --work "$work" --group "$app_pid"; then
+                if [[ "$scenario" != startup ]]; then
+                    if ! python3 "$(dirname -- "$self")/gui_${scenario}.py" --work "$work" --group "$app_pid"; then
                         if ! kill -0 "$app_pid" 2>/dev/null; then
                             local app_result=0
                             wait "$app_pid" || app_result=$?
@@ -74,7 +77,7 @@ check_display() {
                         fi
                         return 1
                     fi
-                    printf 'Диалоги сохранения прошли GUI-регрессию. Логи: %s\n' "$work"
+                    printf 'Сценарий %s прошёл GUI-регрессию. Логи: %s\n' "$scenario" "$work"
                 fi
                 return 0
             fi
@@ -89,16 +92,25 @@ check_display() {
 
 # Служебный вход получает только созданный внешним запуском временный каталог.
 if [[ "${1:-}" == --display ]]; then
-    if (($# != 4)) || [[ ! -d "$3" || ! -x "$2" || -z "${DISPLAY:-}" || ! "$4" =~ ^[01]$ ]]; then exit 2; fi
+    if (($# != 4)) || [[ ! -d "$3" || ! -x "$2" || -z "${DISPLAY:-}" || ! "$4" =~ ^(startup|presets|preset_deletion|compare)$ ]]; then exit 2; fi
     check_display "$2" "$3" "$4"
     stop_app
+    if [[ "$4" == preset_deletion ]]; then
+        mv -- "$3/app.log" "$3/app-before-restart.log"
+        # Старый маркер MainFrame::Show не должен подтвердить готовность нового процесса.
+        mv -- "$3/data/log" "$3/log-before-restart"
+        check_display "$2" "$3" "$4"
+        stop_app
+    fi
     exit 0
 fi
 
-remote='' appimage='' presets=0
+remote='' appimage='' scenario=startup
 while (($#)); do
     case "$1" in
-        --presets) presets=1; shift ;;
+        --presets|--preset-deletion|--compare)
+            if [[ "$scenario" != startup ]]; then printf 'Выбери один GUI-сценарий.\n' >&2; exit 2; fi
+            scenario=${1#--}; scenario=${scenario//-/_}; shift ;;
         --remote|--appimage)
             if (($# < 2)); then printf 'Для %s нужно значение.\n' "$1" >&2; exit 2; fi
             if [[ "$1" == --remote ]]; then remote=$2; else appimage=$2; fi
@@ -134,19 +146,22 @@ if [[ -n "$remote" ]]; then
     fi
     printf 'Пакет и помощник: %s:%s\n' "$remote" "$remote_dir"
     scp -p "${ssh_options[@]}" -- "$self" "$remote:$remote_dir/gui.sh"
-    preset_option=''
-    if ((presets)); then
+    scenario_option=''
+    if [[ "$scenario" != startup ]]; then
         scp -p "${ssh_options[@]}" -- "$(dirname -- "$self")/gui_presets.py" "$remote:$remote_dir/gui_presets.py"
-        preset_option=' --presets'
+        if [[ "$scenario" != presets ]]; then
+            scp -p "${ssh_options[@]}" -- "$(dirname -- "$self")/gui_${scenario}.py" "$remote:$remote_dir/gui_${scenario}.py"
+        fi
+        scenario_option=" --${scenario//_/-}"
     fi
     scp -p "${ssh_options[@]}" -- "$appimage" "$remote:$remote_dir/OrcaSlicer.AppImage"
     digest=$(sha256sum -- "$appimage")
     digest=${digest%% *}
     # Подстановка на клиенте намеренная: digest получен из sha256sum, remote_dir проверен выше,
-    # а preset_option содержит только фиксированный флаг либо пустую строку.
+    # а scenario_option содержит только проверенный фиксированный флаг либо пустую строку.
     # shellcheck disable=SC2029
     ssh "${ssh_options[@]}" "$remote" \
-        "printf '%s  %s\\n' '$digest' '$remote_dir/OrcaSlicer.AppImage' | sha256sum -c - && bash '$remote_dir/gui.sh' --appimage '$remote_dir/OrcaSlicer.AppImage'$preset_option"
+        "printf '%s  %s\\n' '$digest' '$remote_dir/OrcaSlicer.AppImage' | sha256sum -c - && bash '$remote_dir/gui.sh' --appimage '$remote_dir/OrcaSlicer.AppImage'$scenario_option"
     exit $?
 fi
 
@@ -155,8 +170,8 @@ for tool in Xvfb xvfb-run xwininfo dbus-run-session setsid timeout; do
         printf 'Для изолированной GUI-проверки нужен %s.\n' "$tool" >&2; exit 2
     fi
 done
-if ((presets)) && ! command -v python3 >/dev/null; then
-    printf 'Для сценария --presets нужен Python 3 с PyGObject и AT-SPI.\n' >&2
+if [[ "$scenario" != startup ]] && ! command -v python3 >/dev/null; then
+    printf 'Для GUI-сценария нужен Python 3 с PyGObject и AT-SPI.\n' >&2
     exit 2
 fi
 work=$(mktemp -d "${TMPDIR:-/tmp}/orcaslicer-gui.XXXXXXXX")
@@ -177,14 +192,14 @@ if [[ -z "${SSL_CERT_FILE:-}" && -f /etc/ssl/certs/ca-certificates.crt ]]; then
 fi
 unset WAYLAND_DISPLAY
 test_timeout=90
-if ((presets)); then
+if [[ "$scenario" != startup ]]; then
     export NO_AT_BRIDGE=0 LANG=C.UTF-8 LC_ALL=C.UTF-8
-    python3 "$(dirname -- "$self")/gui_presets.py" --work "$work" --prepare
-    test_timeout=240
+    python3 "$(dirname -- "$self")/gui_${scenario}.py" --work "$work" --prepare
+    test_timeout=300
 fi
 if timeout --signal=TERM --kill-after=10s "${test_timeout}s" xvfb-run -a -e "$work/xvfb.log" \
     -s '-screen 0 1600x1000x24 -nolisten tcp' \
-    dbus-run-session -- bash "$self" --display "$appimage" "$work" "$presets" 2>&1 | tee "$work/test.log"; then
+    dbus-run-session -- bash "$self" --display "$appimage" "$work" "$scenario" 2>&1 | tee "$work/test.log"; then
     exit 0
 else
     result=$?

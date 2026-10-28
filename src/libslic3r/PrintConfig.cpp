@@ -1,3 +1,5 @@
+// Определяет параметры печати, их значения по умолчанию и преобразования конфигураций.
+// Тип материала для AMS отделён от признака использования этого материала для поддержек.
 #include "PrintConfig.hpp"
 #include "PrintConfigConstants.hpp"
 #include "ClipperUtils.hpp"
@@ -9948,79 +9950,41 @@ std::map<std::string, std::string> DynamicPrintConfig::validate(bool under_cli)
     }
 }
 
+// Возвращает тип для сопоставления с AMS и его подпись, не изменяя конфигурацию.
+// Для PLA физический тип задаётся явно: признак поддержки не означает PLA-S.
 std::string DynamicPrintConfig::get_filament_type(std::string &displayed_filament_type, int id)
 {
-    auto* filament_id = dynamic_cast<const ConfigOptionStrings*>(this->option("filament_id"));
-    auto* filament_type = dynamic_cast<const ConfigOptionStrings*>(this->option("filament_type"));
-    auto* filament_is_support = dynamic_cast<const ConfigOptionBools*>(this->option("filament_is_support"));
-
-    // get_at() on an empty vector option is undefined behavior (.front() of an empty vector),
-    // and e.g. filament_id is never populated on a CLI from-scratch slice - treat an empty
-    // option the same as a missing one.
-    if (filament_id && filament_id->values.empty())
-        filament_id = nullptr;
-    if (filament_is_support && filament_is_support->values.empty())
-        filament_is_support = nullptr;
-
+    const auto* filament_type = this->option<ConfigOptionStrings>("filament_type");
+    displayed_filament_type.clear();
     if (!filament_type || filament_type->values.empty())
         return "";
 
-    if (!filament_is_support) {
-        if (filament_type) {
-            displayed_filament_type = filament_type->get_at(id);
-            return filament_type->get_at(id);
-        }
-        else {
-            displayed_filament_type = "";
-            return "";
-        }
+    const std::string type = filament_type->get_at(id);
+    displayed_filament_type = type;
+    if (type == "PLA")
+        return type;
+    if (type == "PLA-S") {
+        displayed_filament_type = "Sup.PLA";
+        return type;
     }
-    else {
-        bool is_support = filament_is_support ? filament_is_support->get_at(id) : false;
-        if (is_support) {
-            if (filament_id) {
-                if (filament_id->get_at(id) == "GFS00") {
-                    displayed_filament_type = "Sup.PLA";
-                    return "PLA-S";
-                }
-                else if (filament_id->get_at(id) == "GFS01") {
-                    displayed_filament_type = "Sup.PA";
-                    return "PA-S";
-                }
-                else {
-                    if (filament_type->get_at(id) == "PLA") {
-                        displayed_filament_type = "Sup.PLA";
-                        return "PLA-S";
-                    }
-                    else if (filament_type->get_at(id) == "PA") {
-                        displayed_filament_type = "Sup.PA";
-                        return "PA-S";
-                    }
-                    else {
-                        displayed_filament_type = filament_type->get_at(id);
-                        return filament_type->get_at(id);
-                    }
-                }
-            }
-            else {
-                if (filament_type->get_at(id) == "PLA") {
-                    displayed_filament_type = "Sup.PLA";
-                    return "PLA-S";
-                } else if (filament_type->get_at(id) == "PA") {
-                    displayed_filament_type = "Sup.PA";
-                    return "PA-S";
-                } else {
-                    displayed_filament_type = filament_type->get_at(id);
-                    return filament_type->get_at(id);
-                }
-            }
-        }
-        else {
-            displayed_filament_type = filament_type->get_at(id);
-            return filament_type->get_at(id);
-        }
+
+    // Пустые векторы из CLI равнозначны отсутствующим полям: get_at() использует front().
+    const auto* support = this->option<ConfigOptionBools>("filament_is_support");
+    if (!support || support->values.empty() || !support->get_at(id))
+        return type;
+
+    // Сохраняем прежнее распознавание других семейств; идентификатор не переопределяет PLA/PLA-S.
+    const auto* filament_id = this->option<ConfigOptionStrings>("filament_id");
+    const std::string material_id = filament_id && !filament_id->values.empty() ? filament_id->get_at(id) : "";
+    if (material_id == "GFS00") {
+        displayed_filament_type = "Sup.PLA";
+        return "PLA-S";
     }
-    return "PLA";
+    if (material_id == "GFS01" || type == "PA") {
+        displayed_filament_type = "Sup.PA";
+        return "PA-S";
+    }
+    return type;
 }
 
 bool DynamicPrintConfig::is_using_different_extruders()

@@ -6700,9 +6700,8 @@ void Tab::update_preset_choice()
     update_btns_enabling();
 }
 
-// Called by the UI combo box when the user switches profiles, and also to delete the current profile.
-// Select a preset by a name.If !defined(name), then the default preset is selected.
-// If the current profile is modified, user is asked to save the changes.
+// Переключает профиль или удаляет выбранную запись после разрешения несохранённых изменений.
+// Без видимого профиля выбирается внутренний default; совместимость не запускает удаление соседей.
 bool Tab::select_preset(
     std::string preset_name, bool delete_current /*=false*/, const std::string &last_selected_ph_printer_name /* =""*/, bool force_select, bool force_no_transfer)
 {
@@ -6733,11 +6732,11 @@ bool Tab::select_preset(
             size_t 				      idx_new = 0;
             if (idx_new < presets.size())
                 for (; idx_new < presets.size() && ! presets[idx_new].is_visible; ++ idx_new) ;
-            preset_name = presets[idx_new].name;
             if (idx_new == presets.size()) {
                 // If no name is provided, select the "-- default --" preset.
                 preset_name = m_presets->default_preset().name;
-            }
+            } else
+                preset_name = presets[idx_new].name;
             BOOST_LOG_TRIVIAL(info) << boost::format("not cause by delete current ,choose the first visible, idx %1%, name %2%")
                                         %idx_new %preset_name;
         }
@@ -6855,9 +6854,6 @@ bool Tab::select_preset(
     }
 
     BOOST_LOG_TRIVIAL(info) << boost::format("before delete action, canceled %1%, delete_current %2%") %canceled %delete_current;
-    bool        delete_third_printer = false;
-    std::deque<Preset> filament_presets;
-    std::deque<Preset> process_presets;
     if (! canceled && delete_current) {
         // Delete the file and select some other reasonable preset.
         // It does not matter which preset will be made active as the preset will be re-selected from the preset_name variable.
@@ -6866,32 +6862,16 @@ bool Tab::select_preset(
             //BBS delete preset
             Preset &current_preset = m_presets->get_selected_preset();
 
-            // Obtain compatible filament and process presets for printers
-            if (m_preset_bundle && m_presets->get_preset_base(current_preset) == &current_preset && printer_tab && !current_preset.is_system && !current_preset.is_from_bundle()) {
-                delete_third_printer = true;
-                for (const Preset &preset : m_preset_bundle->filaments.get_presets()) {
-                    if (preset.is_compatible && !preset.is_default) {
-                        if (preset.inherits() != "")
-                            filament_presets.push_front(preset);
-                        else
-                            filament_presets.push_back(preset);
-                    }
-                }
-                for (const Preset &preset : m_preset_bundle->prints.get_presets()) {
-                    if (preset.is_compatible && !preset.is_default) {
-                        if (preset.inherits() != "")
-                            process_presets.push_front(preset);
-                        else
-                            process_presets.push_back(preset);
-                    }
-                }
-            }
-            if (!current_preset.setting_id.empty()) {
-                wxGetApp().delete_preset_from_cloud(current_preset.setting_id, current_preset.file);
-            }
+            // Совместимость не означает владение: удаляем только выбранный профиль,
+            // включая его облачную запись, но не филаменты и печать для этого принтера.
             BOOST_LOG_TRIVIAL(info) << "delete preset = " << current_preset.name << ", setting_id = " << current_preset.setting_id;
             BOOST_LOG_TRIVIAL(info) << boost::format("will delete current preset...");
-            m_presets->delete_current_preset();
+            canceled = !m_presets->delete_current_preset([this](const Preset& selected) {
+                if (selected.type == Preset::TYPE_PRINTER)
+                    m_preset_bundle->physical_printers.delete_preset_from_printers(selected.name);
+                if (!selected.setting_id.empty())
+                    wxGetApp().delete_preset_from_cloud(selected.setting_id, selected.file);
+            });
         } catch (const std::exception & ex) {
             //FIXME add some error reporting!
             canceled = true;
@@ -6953,9 +6933,9 @@ bool Tab::select_preset(
              * to the corresponding printer_technology
              */
             const PrinterTechnology printer_technology = m_presets->get_edited_preset().printer_technology();
-            if (printer_technology == ptFFF && m_dependent_tabs.front() != Preset::Type::TYPE_PRINT)
+            if (printer_technology == ptFFF && (m_dependent_tabs.empty() || m_dependent_tabs.front() != Preset::Type::TYPE_PRINT))
                 m_dependent_tabs = { Preset::Type::TYPE_PRINT, Preset::Type::TYPE_FILAMENT };
-            else if (printer_technology == ptSLA && m_dependent_tabs.front() != Preset::Type::TYPE_SLA_PRINT)
+            else if (printer_technology == ptSLA && (m_dependent_tabs.empty() || m_dependent_tabs.front() != Preset::Type::TYPE_SLA_PRINT))
                 m_dependent_tabs = { Preset::Type::TYPE_SLA_PRINT, Preset::Type::TYPE_SLA_MATERIAL };
         }
 
@@ -6982,36 +6962,6 @@ bool Tab::select_preset(
             default: break;
             }
             Slic3r::fire_lifecycle_event(Slic3r::LifecycleEvent::PresetSelected, ctx);
-        }
-
-        if (delete_third_printer) {
-            wxGetApp().CallAfter([filament_presets, process_presets]() {
-                PresetBundle *preset_bundle     = wxGetApp().preset_bundle;
-                std::string   old_filament_name = preset_bundle->filaments.get_edited_preset().name;
-                std::string   old_process_name  = preset_bundle->prints.get_edited_preset().name;
-
-                for (const Preset &preset : filament_presets) {
-                    if (!preset.setting_id.empty()) {
-                        wxGetApp().delete_preset_from_cloud(preset.setting_id, preset.file);
-                    }
-                    BOOST_LOG_TRIVIAL(info) << "delete filament preset = " << preset.name << ", setting_id = " << preset.setting_id;
-                    preset_bundle->filaments.delete_preset(preset.name);
-                }
-
-                for (const Preset &preset : process_presets) {
-                    if (!preset.setting_id.empty()) {
-                        wxGetApp().delete_preset_from_cloud(preset.setting_id, preset.file);
-                    }
-                    BOOST_LOG_TRIVIAL(info) << "delete print preset = " << preset.name << ", setting_id = " << preset.setting_id;
-                    preset_bundle->prints.delete_preset(preset.name);
-                }
-
-                preset_bundle->update_compatible(PresetSelectCompatibleType::Always);
-                preset_bundle->filaments.select_preset_by_name(old_filament_name, true);
-                preset_bundle->prints.select_preset_by_name(old_process_name, true);
-                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " old filament name is:" << old_filament_name << " old process name is: " << old_process_name;
-
-            });
         }
 
     }
@@ -7571,7 +7521,8 @@ void Tab::save_preset(std::string name /*= ""*/, bool detach, bool save_to_proje
     wxGetApp().mainframe->diff_dialog.update_presets(m_type);
 }
 
-// Called for a currently selected preset.
+// Подтверждает удаление только выбранной записи; наследники могут запретить действие,
+// но совместимые профили и записи физических принтеров не удаляются каскадом.
 void Tab::delete_preset()
 {
     auto current_preset = m_presets->get_selected_preset();
@@ -7581,29 +7532,9 @@ void Tab::delete_preset()
     //std::string action = current_preset.is_external ? _utf8(L("remove")) : _utf8(L("delete"));
     // TRN  remove/delete
     wxString msg;
-    bool     confirm_delete_third_party_printer = false;
     bool     is_base_preset                 = false;
     if (m_presets->get_preset_base(current_preset) == &current_preset) { //root preset
         is_base_preset = true;
-        if (current_preset.type == Preset::Type::TYPE_PRINTER && !current_preset.is_system) { //Customize third-party printers
-            Preset &current_preset = m_presets->get_selected_preset();
-            int filament_preset_num    = 0;
-            int process_preset_num     = 0;
-            for (const Preset &preset : m_preset_bundle->filaments.get_presets()) {
-                if (preset.is_compatible && !preset.is_default) { filament_preset_num++; }
-            }
-            for (const Preset &preset : m_preset_bundle->prints.get_presets()) {
-                if (preset.is_compatible && !preset.is_default) { process_preset_num++; }
-            }
-
-            DeleteConfirmDialog
-                dlg(parent(), wxString(SLIC3R_APP_FULL_NAME) + " - " + _L("Delete"),
-                    wxString::Format(_L("%d Filament Preset and %d Process Preset is attached to this printer. Those presets would be deleted if the printer is deleted."),
-                                     filament_preset_num, process_preset_num));
-            int res = dlg.ShowModal();
-            if (res != wxID_OK) return;
-            confirm_delete_third_party_printer = true;
-        }
         int count = 0;
         wxString presets;
         for (auto &preset2 : *m_presets)
@@ -7627,42 +7558,6 @@ void Tab::delete_preset()
         %Preset::get_type_string(m_type);
     PhysicalPrinterCollection& physical_printers = m_preset_bundle->physical_printers;
 
-    if (m_type == Preset::TYPE_PRINTER && !physical_printers.empty())
-    {
-        // Check preset for delete in physical printers
-        // Ask a customer about next action, if there is a printer with just one preset and this preset is equal to delete
-        std::vector<std::string> ph_printers        = physical_printers.get_printers_with_preset(current_preset.name);
-        std::vector<std::string> ph_printers_only   = physical_printers.get_printers_with_only_preset(current_preset.name);
-
-        //if (!ph_printers.empty()) {
-        //    msg += _L_PLURAL("The physical printer below is based on the preset, you are going to delete.",
-        //                        "The physical printers below are based on the preset, you are going to delete.", ph_printers.size());
-        //    for (const std::string& printer : ph_printers)
-        //        msg += "\n    \"" + from_u8(printer) + "\",";
-        //    msg.RemoveLast();
-        //    msg += "\n" + _L_PLURAL("Note, that the selected preset will be deleted from this printer too.",
-        //                            "Note, that the selected preset will be deleted from these printers too.", ph_printers.size()) + "\n\n";
-        //}
-
-        //if (!ph_printers_only.empty()) {
-        //    msg += _L_PLURAL("The physical printer below is based only on the preset, you are going to delete.",
-        //                        "The physical printers below are based only on the preset, you are going to delete.", ph_printers_only.size());
-        //    for (const std::string& printer : ph_printers_only)
-        //        msg += "\n    \"" + from_u8(printer) + "\",";
-        //    msg.RemoveLast();
-        //    msg += "\n" + _L_PLURAL("Note, that this printer will be deleted after deleting the selected preset.",
-        //                            "Note, that these printers will be deleted after deleting the selected preset.", ph_printers_only.size()) + "\n\n";
-        //}
-        if (!ph_printers.empty() || !ph_printers_only.empty()) {
-            msg += _L_PLURAL("The following preset will be deleted too:", "The following presets will be deleted too:", ph_printers.size() + ph_printers_only.size());
-            for (const std::string &printer : ph_printers) msg += "\n    \"" + from_u8(printer) + "\",";
-            for (const std::string &printer : ph_printers_only) msg += "\n    \"" + from_u8(printer) + "\",";
-            msg.RemoveLast();
-            // msg += "\n" + _L_PLURAL("Note, that the selected preset will be deleted from this printer too.",
-            //                        "Note, that the selected preset will be deleted from these printers too.", ph_printers.size()) + "\n\n";
-        }
-    }
-
     if (is_base_preset && (current_preset.type == Preset::Type::TYPE_FILAMENT) && action == _utf8(L("Delete"))) {
         msg += from_u8(_u8L("Are you sure to delete the selected preset?\nIf the preset corresponds to a filament currently in use on your printer, please reset the filament information for that slot."));
     } else {
@@ -7674,27 +7569,29 @@ void Tab::delete_preset()
     //action = current_preset.is_external ? _utf8(L("Remove")) : _utf8(L("Delete"));
     // TRN  Remove/Delete
     wxString title = from_u8((boost::format(_utf8(L("%1% Preset"))) % action).str());  //action + _(L(" Preset"));
-    if (current_preset.is_default || !(confirm_delete_third_party_printer ||
-        //wxID_YES != wxMessageDialog(parent(), msg, title, wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION).ShowModal())
-        wxID_YES == MessageDialog(parent(), msg, title, wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION).ShowModal()))
+    if (current_preset.is_default ||
+        wxID_YES != MessageDialog(parent(), msg, title, wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION).ShowModal())
         return;
 
     // if we just delete preset from the physical printer
     if (m_presets_choice->is_selected_physical_printer()) {
-        PhysicalPrinter& printer = physical_printers.get_selected_printer();
+        PhysicalPrinter printer = physical_printers.get_selected_printer();
 
         // just delete this preset from the current physical printer
         printer.delete_preset(m_presets->get_edited_preset().name);
+        physical_printers.save_printer(printer);
+        if (printer.preset_names.empty()) {
+            // Запись устройства сохраняется и без профилей; выбирать первый элемент пустого набора нельзя.
+            physical_printers.unselect_printer();
+            this->select_preset(current_preset.name);
+            return;
+        }
         // select first from the possible presets for this printer
         physical_printers.select_printer(printer);
 
         this->select_preset(physical_printers.get_selected_printer_preset_name());
         return;
     }
-
-    // delete selected preset from printers and printer, if it's needed
-    if (m_type == Preset::TYPE_PRINTER && !physical_printers.empty())
-        physical_printers.delete_preset_from_printers(current_preset.name);
 
     // Select will handle of the preset dependencies, of saving & closing the depending profiles, and
     // finally of deleting the preset.

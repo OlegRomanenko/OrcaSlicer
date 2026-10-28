@@ -657,7 +657,9 @@ public:
 
     // Delete the current preset, activate the first visible preset.
     // returns true if the preset was deleted successfully.
-    bool            delete_current_preset();
+    // Вызывает before_delete только для разрешённой к удалению выбранной записи.
+    // Обработчик может поставить облачное задание, но не должен менять эту коллекцию.
+    bool            delete_current_preset(const std::function<void(const Preset&)>& before_delete = {});
     // Delete the current preset, activate the first visible preset.
     // returns true if the preset was deleted successfully.
     // When force=true, bypasses the can_overwrite() check (used for bundle preset cleanup).
@@ -1135,9 +1137,8 @@ public:
     // Delete the selected preset
     // returns true if the preset was deleted successfully.
     bool            delete_selected_printer();
-    // Delete preset_name preset from all printers:
-    // If there is last preset for the printer and first_check== false, then delete this printer
-    // returns true if all presets were deleted successfully.
+    // Удаляет ссылки на профиль, сохраняя физические принтеры даже без оставшихся профилей.
+    // Возвращает true после сохранения изменённых записей; ошибки записи передаются вызывающему коду.
     bool            delete_preset_from_printers(const std::string& preset_name);
 
     // Get list of printers which have more than one preset and "preset_names" preset is one of them
@@ -1165,7 +1166,8 @@ public:
     std::string     get_selected_printer_preset_name() const { return (m_idx_selected == size_t(-1)) ? std::string() : m_selected_preset; }
 
     // Select printer by the full printer name, which contains name of printer, separator and name of selected preset
-    // If full_name doesn't contain name of selected preset, then select first preset in the list for this printer
+    // If full_name doesn't contain name of selected preset, then select first preset in the list for this printer.
+    // Устройство без профилей сохраняется, но не может быть выбрано для печати.
     void select_printer(const std::string& full_name);
     void select_printer(const PhysicalPrinter& printer);
     void select_printer(const std::string& printer_name, const std::string& preset_name);
